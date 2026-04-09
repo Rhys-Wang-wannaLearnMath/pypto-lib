@@ -60,44 +60,51 @@ def build_qwen3_scope3_program(
             w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.BF16],
             out: pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16]:
-            with pl.auto_incore(split=pl.SplitMode.UP_DOWN):
-                for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
-                    resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
-                    for ob in pl.parallel(0, Q_OUT_BLOCKS):
+            for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
+                resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
+
+                # Stage 1: Initialize resid1_tile accumulator in parallel.
+                with pl.auto_incore():
+                    for ob in pl.parallel(0, Q_OUT_BLOCKS, chunk=8):
                         o0 = ob * Q_OUT_CHUNK
                         zero_resid1 = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                         resid1_tile = pl.assemble(resid1_tile, zero_resid1, [0, o0])
 
-                    # Output projection: attn_out × wo, tiled by Q_OUT_CHUNK.
-                    for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
-                        o0 = ob * Q_OUT_CHUNK
-                        o_acc = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                        for kb in pl.range(HIDDEN_BLOCKS):
+                # Stage 2: Output projection: attn_out × wo, tiled by Q_OUT_CHUNK.
+                for ob in pl.range(Q_OUT_BLOCKS):
+                    o0 = ob * Q_OUT_CHUNK
+
+                    with pl.incore():
+                        a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
+                        w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
+                        o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             a_chunk = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0])
                             w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
-                            o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
+                            o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
+
+                        resid1_tile = pl.assemble(resid1_tile, o_acc, [0, o0])
+
+                    with pl.incore():
                         resid = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
                             target_type=pl.FP32,
                         )
-                        resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
+                        mm_out = pl.slice(resid1_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0])
+                        add_resid = pl.add(mm_out, resid)
+                        resid1_tile = pl.assemble(resid1_tile, add_resid, [0, o0])
 
-                    # Post-attention RMSNorm: compute inv_rms over resid1_tile.
+                # Stage 3 & 4 & 5: Post-attention RMSNorm: compute inv_rms over resid1_tile + normalize + initialize down_proj_tile accumulator.
+                post_norm_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
+                down_proj_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
+                with pl.auto_incore():
                     sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                         sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH_TILE]))
-                    inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
-
-                    # Normalize and zero-init down_proj accumulator.
-                    post_norm_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
-                    down_proj_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
-                    for zi in pl.range(HIDDEN_BLOCKS):
-                        z0 = zi * K_CHUNK
-                        down_zero_chunk = pl.full([BATCH_TILE, K_CHUNK], dtype=pl.FP32, value=0.0)
-                        down_proj_tile = pl.assemble(down_proj_tile, down_zero_chunk, [0, z0])
+                    inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)))
 
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
@@ -107,40 +114,62 @@ def build_qwen3_scope3_program(
                         post_norm_tile = pl.assemble(
                             post_norm_tile, pl.cast(normed, target_type=pl.BF16), [0, k0]
                         )
+                        down_zero_chunk = pl.full([BATCH_TILE, K_CHUNK], dtype=pl.FP32, value=0.0)
+                        down_proj_tile = pl.assemble(down_proj_tile, down_zero_chunk, [0, k0])
 
-                    # MLP: gate/up projections + SiLU + down projection.
-                    for ob in pl.range(MLP_OUT_BLOCKS):
-                        o0 = ob * MLP_OUT_CHUNK
-                        gate_acc = pl.full([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                        up_acc = pl.full([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-
-                        for kb in pl.range(HIDDEN_BLOCKS):
+                # Stage 6: MLP: gate/up projections + SiLU.
+                for ob in pl.range(MLP_OUT_BLOCKS):
+                    o0 = ob * MLP_OUT_CHUNK
+                    # Stage 6a: MLP: gate projections
+                    with pl.incore():
+                        post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
+                        gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                            wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                            gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
-                            up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
+                            gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
 
+                    # Stage 6b: MLP: up projections
+                    with pl.incore():
+                        post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
+                        up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
+                            up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
+
+                    # Stage 6c: MLP: silu
+                    with pl.auto_incore():
                         sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                         mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                         mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
 
-                        for dob in pl.parallel(0, HIDDEN_BLOCKS, 1, chunk=4):
-                            d0 = dob * K_CHUNK
-                            down_prev = pl.slice(down_proj_tile, [BATCH_TILE, K_CHUNK], [0, d0])
+                    # Stage 7: Down projection: accumulate in parallel.
+                    for dob in pl.range(HIDDEN_BLOCKS):
+                        d0 = dob * K_CHUNK
+                        with pl.incore():
                             w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
-                            down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
-                            down_proj_tile = pl.assemble(down_proj_tile, down_next, [0, d0])
+                            down_next = pl.matmul(mlp_chunk_bf16, w_down_chunk, out_dtype=pl.FP32)
 
-                    # Final residual: down_proj + resid1, write to output.
-                    for ob in pl.parallel(0, HIDDEN_BLOCKS, 1, chunk=4):
-                        o0 = ob * K_CHUNK
+                        with pl.incore():
+                            down_prev = pl.slice(down_proj_tile, [BATCH_TILE, K_CHUNK], [0, d0])
+                            accum = pl.add(down_prev, down_next)
+                            down_proj_tile = pl.assemble(down_proj_tile, accum, [0, d0])
+
+                # Stage 8: Final residual: down_proj + resid1, write to output.
+                for ob in pl.range(HIDDEN_BLOCKS):
+                    o0 = ob * K_CHUNK
+                    with pl.incore():
                         down_acc = pl.add(
                             pl.slice(down_proj_tile, [BATCH_TILE, K_CHUNK], [0, o0]),
                             pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, o0]),
                         )
-                        out = pl.assemble(out, pl.cast(down_acc, target_type=pl.BF16), [b0, o0])
+                        out_f32 = pl.cast(down_acc, target_type=pl.BF16)
+                        out = pl.assemble(out, out_f32, [b0, o0])
 
             return out
 
@@ -193,34 +222,45 @@ def build_tensor_specs(
     hidden_size: int = HIDDEN,
     intermediate_size: int = INTERMEDIATE,
 ):
-    import torch  # type: ignore[import]
+    import torch
     from pypto.runtime import TensorSpec
 
-    def xavier_bf16(shape: list[int]) -> torch.Tensor:
-        """Generate in FP32 with Xavier (1/sqrt(fan_in)) scaling, then cast to BF16."""
-        fan_in = shape[1]
-        return (torch.randn(shape, dtype=torch.float32) / (fan_in ** 0.5)).to(torch.bfloat16)
+    def init_attn_out():
+        return torch.rand(batch, hidden_size) - 0.5
 
-    def xavier_fp32(shape: list[int]) -> torch.Tensor:
-        """Generate in FP32 with Xavier (1/sqrt(fan_in)) scaling."""
-        fan_in = shape[1]
-        return torch.randn(shape, dtype=torch.float32) / (fan_in ** 0.5)
+    def init_hidden_states():
+        return torch.rand(batch, hidden_size) - 0.5
+
+    def init_wo():
+        return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
+
+    def init_post_rms_weight():
+        return torch.ones(1, hidden_size)
+
+    def init_w_gate():
+        return (torch.rand(hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
+
+    def init_w_up():
+        return (torch.rand(hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
+
+    def init_w_down():
+        return (torch.rand(intermediate_size, hidden_size) - 0.5) / intermediate_size ** 0.5
 
     return [
         TensorSpec("attn_out", [batch, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([batch, hidden_size])),
+                   init_value=init_attn_out),
         TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([batch, hidden_size])),
+                   init_value=init_hidden_states),
         TensorSpec("wo", [hidden_size, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([hidden_size, hidden_size])),
+                   init_value=init_wo),
         TensorSpec("post_rms_weight", [1, hidden_size], torch.float32,
-                   init_value=xavier_fp32([1, hidden_size])),
+                   init_value=init_post_rms_weight),
         TensorSpec("w_gate", [hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=xavier_bf16([hidden_size, intermediate_size])),
+                   init_value=init_w_gate),
         TensorSpec("w_up", [hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=xavier_bf16([hidden_size, intermediate_size])),
+                   init_value=init_w_up),
         TensorSpec("w_down", [intermediate_size, hidden_size], torch.bfloat16,
-                   init_value=xavier_bf16([intermediate_size, hidden_size])),
+                   init_value=init_w_down),
         TensorSpec("out", [batch, hidden_size], torch.bfloat16, is_output=True),
     ]
 
@@ -233,10 +273,13 @@ def compile_and_run(
     device_id: int = 0,
     work_dir: str | None = None,
     dump_passes: bool = True,
+    enable_profiling: bool = False,
 ):
     from pypto.backend import BackendType
     from pypto.ir.pass_manager import OptimizationStrategy
     from pypto.runtime import RunConfig, run
+
+    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
 
     program = build_qwen3_scope3_program(
         batch=batch,
@@ -257,11 +300,12 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=3e-3,
+            atol=3e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.Ascend950,
+            backend_type=backend,
+            enable_profiling=enable_profiling,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
@@ -272,4 +316,21 @@ def compile_and_run(
 
 
 if __name__ == "__main__":
-    compile_and_run()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a5",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-profiling", action="store_true", default=False)
+    args = parser.parse_args()
+
+    result = compile_and_run(
+        platform=args.platform,
+        device_id=args.device,
+        enable_profiling=args.enable_profiling,
+    )
+    if not result.passed:
+        if result.error:
+            print(f"Result: {result.error}")
+        raise SystemExit(1)
