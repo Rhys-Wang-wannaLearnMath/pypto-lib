@@ -1,10 +1,18 @@
 # PyPTO-Lib: Primitive Tensor Function Library
 
+[![CI](https://github.com/hw-native-sys/pypto-lib/actions/workflows/ci.yml/badge.svg)](https://github.com/hw-native-sys/pypto-lib/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: CANN Open Software](https://img.shields.io/badge/license-CANN%20OSL%202.0-green.svg)](LICENSE)
+
+> **[中文版 README](README_CN.md)**
+
+---
+
 ## 1. Purpose
 
 **PyPTO-Lib** is a library of **primitive tensor functions** built on top of the programming framework defined in the **pypto** subfolder. It provides a fixed set of low-level, hardware-agnostic **tensor-level** operations that serve as the building blocks for higher-level kernels and model graphs—analogous to the role of **PyTorch ATen** primitive functions in the PyTorch stack.
 
-**Where the library lives.** Defining a new function set **at the tile level** would add very little value: tile-level operations are essentially PTO-ISA instructions already. The library’s value is at the **tensor level**: primitives are operations on **tensors** (e.g. `max(x, axis)`, `exp(x)`, `sum(x, axis)`). The **compiler** is responsible for tiling those tensor ops into loops over tiles and lowering each tile to PTO-ISA. So PyPTO-Lib defines the **tensor-level** primitive set; tiling and PTO-ISA are the **lowering** of that set, not a second layer of “tile-level primitives” on top of PTO-ISA.
+**Where the library lives.** Defining a new function set **at the tile level** would add very little value: tile-level operations are essentially PTO-ISA instructions already. The library's value is at the **tensor level**: primitives are operations on **tensors** (e.g. `max(x, axis)`, `exp(x)`, `sum(x, axis)`). The **compiler** is responsible for tiling those tensor ops into loops over tiles and lowering each tile to PTO-ISA. So PyPTO-Lib defines the **tensor-level** primitive set; tiling and PTO-ISA are the **lowering** of that set, not a second layer of "tile-level primitives" on top of PTO-ISA.
 
 This document describes the **method of building** that library and the **three core purposes** it must accomplish:
 
@@ -597,3 +605,416 @@ This ensures there are enough clusters to execute the SPMD incore function group
 
 - **PyTorch eager execution mode**  
   The **block_incore** function can also be **orchestrated in PyTorch eager execution mode**. In this mode, the program launches SPMD kernels written in the **pyPTO** grammar and compile chain directly from Python, without using the pto-runtime. This gives a **simple path** to run pyPTO-compiled SPMD kernels (e.g. for prototyping or when full task-graph scheduling is not needed), avoiding the complexity of the pto-runtime while still reusing the same pyPTO front-end and compiler.
+
+---
+
+## 12. Project Structure
+
+```
+pypto-lib/
+├── README.md                     # This document
+├── README_CN.md                  # Chinese version
+├── LICENSE
+├── ruff.toml                     # Ruff linter configuration (Python 3.10+, line-length 110)
+├── .pre-commit-config.yaml       # Pre-commit hooks: header check, English-only check, ruff
+├── .github/
+│   ├── workflows/ci.yml          # CI: pre-commit, simulator tests, on-device (a2a3) tests
+│   └── ISSUE_TEMPLATE/           # Bug report, feature request, documentation templates
+├── golden/                       # Golden testing infrastructure
+│   ├── __init__.py               # Exports: TensorSpec, validate_golden, RunConfig, run
+│   ├── tensor_spec.py            # TensorSpec dataclass for tensor description
+│   ├── runner.py                 # Compile → execute → golden compare pipeline
+│   └── validation.py             # torch.allclose-based output validation
+├── examples/
+│   ├── beginner/                 # Entry-level examples
+│   │   ├── hello_world.py        # Elementwise add-one with row-chunk tiling
+│   │   └── matmul.py             # Tiled matmul with M/N blocking
+│   ├── intermediate/             # Common ML kernels
+│   │   ├── softmax.py            # Row-wise numerically stable softmax
+│   │   ├── layer_norm.py         # Full LayerNorm with gamma/beta
+│   │   ├── rms_norm.py           # RMSNorm with row + column tiling (two-pass)
+│   │   ├── rope.py               # Rotary Position Embedding (half-vector rotation)
+│   │   └── gemm.py               # GEMM with M/N/K blocking (matmul_acc)
+│   └── models/                   # Full model-layer implementations
+│       ├── qwen3/                # Qwen3-32B: decode, prefill, training, tilelet variants
+│       ├── deepseek_v3_2/        # DeepSeek V3.2: MLA decode/prefill (front/back split)
+│       ├── kimi/                 # Kimi K2: MoE decode with sliding-window attention
+│       └── milm/                 # MiLM-7B: Llama-style decode with SwiGLU + GQA
+├── tests/
+│   ├── golden/                   # Unit tests for the golden infrastructure
+│   │   ├── conftest.py           # Adds repo root to sys.path
+│   │   ├── test_tensor_spec.py   # Tests for TensorSpec.create_tensor()
+│   │   └── test_validation.py    # Tests for validate_golden()
+│   └── lint/
+│       ├── check_headers.py      # Verifies CANN license headers on all .py files
+│       └── check_english_only.py # Ensures source files contain ASCII/English only
+└── docs/
+    ├── para_for.md               # Loop grammar: unified for/pl.range, parallel, chunk
+    ├── pto2_rt.md                # PTO-RT2 runtime design
+    └── pypto-frontend-coding-style.md  # Frontend coding conventions
+```
+
+---
+
+## 13. Prerequisites and Installation
+
+### 13.1 System requirements
+
+- **Python** >= 3.10
+- **PyTorch** (CPU or NPU build)
+- **pypto** — the compiler and language framework ([github.com/hw-native-sys/pypto](https://github.com/hw-native-sys/pypto))
+- **ptoas** — PTO assembler & optimizer binary ([github.com/hw-native-sys/PTOAS](https://github.com/hw-native-sys/PTOAS))
+- **pto-isa** — PTO-ISA C++ runtime library ([github.com/hw-native-sys/pto-isa](https://github.com/hw-native-sys/pto-isa))
+
+For **on-device** execution (Ascend NPU):
+
+- Ascend CANN toolkit (e.g. 8.5.0)
+- NPU device accessible via `npu-smi`
+
+### 13.2 Install steps
+
+```bash
+# 1. Clone pypto-lib
+git clone https://github.com/hw-native-sys/pypto-lib.git
+cd pypto-lib
+
+# 2. Install pypto (compiler + runtime)
+git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+pip install /tmp/pypto
+pip install /tmp/pypto/runtime        # simpler runtime
+
+# 3. Install ptoas binary (example: x86_64, v0.25)
+curl -L https://github.com/hw-native-sys/PTOAS/releases/download/v0.25/ptoas-bin-x86_64.tar.gz \
+  -o /tmp/ptoas.tar.gz
+mkdir -p $HOME/ptoas-bin && tar -xzf /tmp/ptoas.tar.gz -C $HOME/ptoas-bin
+export PTOAS_ROOT=$HOME/ptoas-bin
+
+# 4. Clone pto-isa (pinned commit)
+git clone https://github.com/hw-native-sys/pto-isa.git $HOME/pto-isa
+export PTO_ISA_ROOT=$HOME/pto-isa
+
+# 5. Install Python dependencies
+pip install torch nanobind
+```
+
+---
+
+## 14. Quick Start
+
+### 14.1 Hello World — elementwise add-one
+
+The simplest example (`examples/beginner/hello_world.py`) splits a matrix into row chunks and adds 1 elementwise:
+
+```python
+import pypto.language as pl
+
+ROWS, COLS, ROW_CHUNK = 1024, 512, 128
+
+@pl.program
+class HelloWorldProgram:
+    @pl.function(type=pl.FunctionType.Opaque)
+    def add_one(
+        self,
+        x: pl.Tensor[[ROWS, COLS], pl.FP32],
+        y: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+    ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            for r in pl.parallel(0, ROWS, 1, chunk=ROW_CHUNK):
+                tile_x = pl.slice(x, [1, COLS], [r, 0])
+                tile_y = pl.add(tile_x, 1.0)
+                y = pl.assemble(y, tile_y, [r, 0])
+        return y
+```
+
+**Key patterns:**
+
+- **`@pl.program`** / **`@pl.function`** — declare a pypto program and its orchestration function.
+- **`pl.Tensor[[shape], dtype]`** — tensor type annotation; **`pl.Out[...]`** marks an output tensor.
+- **`pl.parallel(start, end, step, chunk=C)`** — parallel loop with chunk-based tiling; the compiler splits into a chunk loop (outer) + in-chunk loop (inner).
+- **`pl.slice(tensor, sizes, offsets)`** — extract a tile view from a tensor.
+- **`pl.assemble(dst, tile, offsets)`** — write a tile back into the output tensor at the given offsets.
+- **`pl.at(level=..., optimization=...)`** — specify the execution level and optimisation strategy.
+
+### 14.2 Running an example
+
+```bash
+# Simulator mode (no NPU required)
+python examples/beginner/hello_world.py -p a2a3sim
+
+# On-device mode (requires Ascend NPU)
+python examples/beginner/hello_world.py -p a2a3 -d 0
+
+# With runtime profiling
+python examples/beginner/hello_world.py -p a2a3 -d 0 --runtime-profiling
+```
+
+All examples accept the same CLI flags:
+
+| Flag | Description |
+|------|-------------|
+| `-p`, `--platform` | Target platform: `a2a3`, `a2a3sim`, `a5`, `a5sim` |
+| `-d`, `--device` | Device ID (default: 0) |
+| `--runtime-profiling` | Enable runtime profiling output |
+
+---
+
+## 15. `pypto.language` API Reference (Commonly Used Ops)
+
+The following operations from `pypto.language` (imported as `pl`) are used throughout examples. They form the **tensor-level primitive set** of PyPTO-Lib.
+
+### 15.1 Tensor construction and views
+
+| API | Description |
+|-----|-------------|
+| `pl.Tensor[[shape], dtype]` | Tensor type annotation (e.g. `pl.FP32`, `pl.BF16`) |
+| `pl.Out[pl.Tensor[...]]` | Output tensor annotation |
+| `pl.slice(tensor, sizes, offsets)` | Extract a tile (view) from a tensor at given offsets |
+| `pl.assemble(dst, tile, offsets)` | Write a tile back into a tensor at given offsets |
+| `pl.create_tensor(shape, dtype=...)` | Allocate a new local tensor |
+| `pl.reshape(tensor, new_shape)` | Reshape a tensor (view operation) |
+
+### 15.2 Elementwise operations
+
+| API | Description |
+|-----|-------------|
+| `pl.add(a, b)` | Elementwise addition (tensor + tensor or tensor + scalar) |
+| `pl.sub(a, b)` | Elementwise subtraction |
+| `pl.mul(a, b)` | Elementwise multiplication |
+| `pl.exp(x)` | Elementwise exponential |
+| `pl.sqrt(x)` | Elementwise square root |
+| `pl.rsqrt(x)` | Elementwise reciprocal square root (1/sqrt) |
+| `pl.neg(x)` | Elementwise negation |
+| `pl.recip(x)` | Elementwise reciprocal (1/x) |
+
+### 15.3 Row/column broadcast operations
+
+| API | Description |
+|-----|-------------|
+| `pl.row_expand_sub(matrix, row_vec)` | Subtract a row vector from each row |
+| `pl.row_expand_mul(matrix, row_vec)` | Multiply each row by a row vector |
+| `pl.row_expand_div(matrix, row_vec)` | Divide each row by a row vector |
+| `pl.col_expand_mul(matrix, col_vec)` | Multiply each column by a column vector |
+
+### 15.4 Reductions
+
+| API | Description |
+|-----|-------------|
+| `pl.row_max(matrix)` | Row-wise maximum (returns column vector) |
+| `pl.row_sum(matrix)` | Row-wise sum (returns column vector) |
+
+### 15.5 Linear algebra
+
+| API | Description |
+|-----|-------------|
+| `pl.matmul(a, b)` | Matrix multiplication: `C = A @ B` |
+| `pl.matmul_acc(acc, a, b)` | Accumulating matmul: `acc += A @ B` |
+
+### 15.6 Loop constructs
+
+| API | Description |
+|-----|-------------|
+| `pl.parallel(start, end, step, chunk=C)` | Parallel loop with chunk-based tiling |
+| `pl.range(end)` / `pl.range(start, end)` / `pl.range(start, end, step)` | Sequential loop (like Python `range`) |
+
+### 15.7 Execution context
+
+| API | Description |
+|-----|-------------|
+| `pl.at(level=..., optimization=...)` | Set execution level (`pl.Level.CORE_GROUP`) and optimizer (`pl.chunked_loop_optimizer`) |
+| `@pl.program` | Class decorator to declare a pypto program |
+| `@pl.function(type=pl.FunctionType.Opaque)` | Method decorator for an orchestration function |
+
+---
+
+## 16. Examples Gallery
+
+### 16.1 Beginner
+
+| Example | File | Description |
+|---------|------|-------------|
+| **Hello World** | `examples/beginner/hello_world.py` | Elementwise `y = x + 1` with row-chunk parallel loop |
+| **Matmul** | `examples/beginner/matmul.py` | Tiled `C = A @ B` with M/N parallel blocking (no K tiling) |
+
+### 16.2 Intermediate
+
+| Example | File | Description |
+|---------|------|-------------|
+| **Softmax** | `examples/intermediate/softmax.py` | Row-wise numerically stable softmax: max → sub → exp → sum → div |
+| **LayerNorm** | `examples/intermediate/layer_norm.py` | Full `(x - mean) / sqrt(var + eps) * gamma + beta` with row-only tiling |
+| **RMSNorm** | `examples/intermediate/rms_norm.py` | Two-pass RMSNorm with row + column tiling for large hidden dims |
+| **RoPE** | `examples/intermediate/rope.py` | Rotary Position Embedding with half-vector cos/sin rotation |
+| **GEMM** | `examples/intermediate/gemm.py` | Full GEMM with M/N/K blocking using `pl.matmul` + `pl.matmul_acc` |
+
+**Example: Softmax kernel** (`examples/intermediate/softmax.py`)
+
+```python
+for r in pl.parallel(0, rows, row_chunk, chunk=1):
+    tile_x = pl.slice(x, [row_chunk, cols], [r, 0])
+    row_max = pl.row_max(tile_x)                      # Step 1: row-wise max
+    shifted = pl.row_expand_sub(tile_x, row_max)       # Step 2: x - max(x)
+    exp_shifted = pl.exp(shifted)                       # Step 3: exp(x - max(x))
+    row_sum = pl.row_sum(exp_shifted)                   # Step 4: row-wise sum
+    result = pl.row_expand_div(exp_shifted, row_sum)    # Step 5: normalise
+    y = pl.assemble(y, result, [r, 0])
+```
+
+**Example: GEMM with K-tiling** (`examples/intermediate/gemm.py`)
+
+```python
+for mb in pl.parallel(0, m, m_tile, chunk=m_chunk):
+    for nb in pl.parallel(0, n, n_tile, chunk=n_chunk):
+        tile_a = pl.slice(a, [m_tile, k_tile], [mb, 0])
+        tile_b = pl.slice(b, [k_tile, n_tile], [0, nb])
+        acc = pl.matmul(tile_a, tile_b)                 # First K-tile
+        for kb in pl.range(1, k_blocks):                # Remaining K-tiles
+            k0 = kb * k_tile
+            tile_a_i = pl.slice(a, [m_tile, k_tile], [mb, k0])
+            tile_b_i = pl.slice(b, [k_tile, n_tile], [k0, nb])
+            acc = pl.matmul_acc(acc, tile_a_i, tile_b_i)
+        c = pl.assemble(c, acc, [mb, nb])
+```
+
+### 16.3 Model-Level Examples
+
+Full single-layer Transformer implementations for production LLMs:
+
+| Model | Directory | Highlights |
+|-------|-----------|------------|
+| **Qwen3-32B** | `examples/models/qwen3/` | 14 variants: decode, prefill, training forward+backward, tilelet, scope-level breakdowns, mixed precision |
+| **DeepSeek V3.2** | `examples/models/deepseek_v3_2/` | MLA (Multi-head Latent Attention) with front/back split, sparse attention via `index_topk` |
+| **Kimi K2** | `examples/models/kimi/` | MoE (8 experts + 1 shared), sliding-window attention, SwiGLU |
+| **MiLM-7B** | `examples/models/milm/` | Llama-style GQA + SwiGLU + RoPE, optimised for mobile/edge deployment |
+
+These model examples demonstrate real-world patterns: **multi-scope incore boundaries**, **K/V cache management**, **MoE routing**, **two-pass normalisation**, and **fused attention kernels**.
+
+---
+
+## 17. Golden Testing Framework
+
+The `golden/` package provides an end-to-end **compile → execute → validate** pipeline for testing PyPTO programs against PyTorch reference implementations.
+
+### 17.1 Core components
+
+- **`TensorSpec`** (`golden/tensor_spec.py`) — Describes a tensor's name, shape, dtype, initialisation strategy, and whether it is an output:
+
+  ```python
+  from golden import TensorSpec
+  specs = [
+      TensorSpec("x", [512, 256], torch.float32, init_value=torch.randn),
+      TensorSpec("y", [512, 256], torch.float32, is_output=True),
+  ]
+  ```
+
+  Supported `init_value` types: `None` (zeros), `int`/`float` (constant fill), `torch.Tensor` (direct), or callable (`torch.randn`, `torch.rand`, `torch.zeros`, `torch.ones`, or custom).
+
+- **`run()`** (`golden/runner.py`) — The main entry point:
+
+  ```python
+  from golden import RunConfig, run
+
+  result = run(
+      program=build_softmax_program(),
+      tensor_specs=build_tensor_specs(),
+      golden_fn=golden_softmax,      # PyTorch reference function
+      config=RunConfig(rtol=1e-5, atol=1e-5, runtime=dict(platform="a2a3sim")),
+  )
+  assert result.passed
+  ```
+
+  The pipeline: *compile* via `pypto.ir.compile` → *generate inputs* from specs → *execute on device* → *compute golden reference* → *validate with `torch.allclose`*.
+
+- **`validate_golden()`** (`golden/validation.py`) — Compares device outputs against golden tensors element-wise. On mismatch, reports the count and first 20 mismatched elements with their actual vs expected values.
+
+- **`RunConfig`** (`golden/runner.py`) — Configuration dataclass:
+
+  | Field | Type | Default | Description |
+  |-------|------|---------|-------------|
+  | `rtol` | `float` | `1e-5` | Relative tolerance |
+  | `atol` | `float` | `1e-5` | Absolute tolerance |
+  | `compile_only` | `bool` | `False` | Stop after codegen (no execution) |
+  | `compile` | `dict` | `{}` | Kwargs forwarded to `pypto.ir.compile` |
+  | `runtime` | `dict` | `{}` | Kwargs forwarded to `pypto.runtime.RunConfig` |
+
+### 17.2 Example structure in every example file
+
+Every example follows a consistent three-function pattern:
+
+```python
+def build_<name>_program(...):       # Returns @pl.program class
+    ...
+
+def build_tensor_specs(...):          # Returns list[TensorSpec]
+    ...
+
+def golden_<name>(tensors):           # PyTorch reference (in-place)
+    ...
+
+if __name__ == "__main__":
+    result = run(program=..., tensor_specs=..., golden_fn=..., config=...)
+```
+
+### 17.3 Running tests
+
+```bash
+# Unit tests for the golden infrastructure
+pytest tests/golden/ -v
+
+# Run all beginner + intermediate examples in simulator
+for f in $(find examples/beginner examples/intermediate -name '*.py' | sort); do
+    python "$f" -p a2a3sim
+done
+```
+
+---
+
+## 18. CI and Supported Platforms
+
+### 18.1 CI pipeline (`.github/workflows/ci.yml`)
+
+The CI runs three jobs on every push/PR to `main`:
+
+| Job | Runner | What it does |
+|-----|--------|--------------|
+| **pre-commit** | `ubuntu-latest` | License header check, English-only check, ruff lint |
+| **sim** | `ubuntu-latest` | Runs all beginner + intermediate examples on **a2a3sim** and **a5sim** simulators |
+| **a2a3** | Self-hosted ARM64 NPU | Runs all beginner + intermediate examples on **real Ascend NPU** |
+
+### 18.2 Supported platforms
+
+| Platform | Description | Requires hardware |
+|----------|-------------|-------------------|
+| `a2a3sim` | Ascend 910B simulator | No |
+| `a5sim` | Ascend 950 simulator | No |
+| `a2a3` | Ascend 910B on-device | Yes (NPU) |
+| `a5` | Ascend 950 on-device | Yes (NPU) |
+
+### 18.3 Pre-commit hooks
+
+```bash
+# Install pre-commit and run all checks
+pip install pre-commit
+pre-commit run --all-files
+```
+
+Hooks:
+- **check-headers** — Verifies CANN Open Software License header on all `.py` files.
+- **check-english-only** — Ensures source files (`.py`) contain only ASCII/English characters.
+- **ruff-check** — Runs ruff linter with pyflakes rules (unused imports, undefined names).
+
+---
+
+## 19. Contributing
+
+1. Fork the repository and create a feature branch.
+2. Follow the coding conventions in `docs/pypto-frontend-coding-style.md`.
+3. Ensure all `.py` files have the CANN license header (see any existing file for the template).
+4. Add golden tests for new examples (follow the `build_program` / `build_tensor_specs` / `golden_fn` pattern).
+5. Run pre-commit hooks: `pre-commit run --all-files`.
+6. Run examples against a simulator: `python examples/<path>.py -p a2a3sim`.
+7. Submit a pull request to `main`.
+
+---
+
+## 20. License
+
+PyPTO-Lib is licensed under the **CANN Open Software License Agreement Version 2.0**. See [LICENSE](LICENSE) for the full text.
