@@ -24,10 +24,15 @@
 git clone https://github.com/hw-native-sys/pypto-lib.git
 cd pypto-lib
 
-# 2. 确保 /tmp 权限正确（权限不对会导致 apt/pip 报 "Couldn't create temporary file" 错误）
+# 2. 安装 uv（Python 包管理器，用于快速创建虚拟环境和安装依赖）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 安装后需要重新加载 shell 配置或重新打开终端
+source ~/.bashrc  # 或 source ~/.zshrc
+
+# 3. 确保 /tmp 权限正确（权限不对会导致 apt/pip 报 "Couldn't create temporary file" 错误）
 sudo chmod 1777 /tmp
 
-# 3. 安装系统依赖
+# 4. 安装系统依赖
 sudo apt-get update
 sudo apt-get install -y ninja-build
 
@@ -149,6 +154,33 @@ $PTOAS_ROOT/ptoas --version
 | 文件 | 范围 | HIDDEN | 容差 |
 |---|---|---|---|
 | `qwen3_32b_training_forward_and_backward.py` | 前向 + 反向 + 优化器 | 5120 | — |
+
+### 3.4 设备负担排序（由轻到重）
+
+以下按对设备（NPU / 模拟器）的 **计算量和内存开销** 从低到高排序。
+核心区分因素：Decode 每 batch 仅处理 1 个 token（共 BATCH=16 tokens），
+而 Prefill 处理最多 BATCH×MAX_SEQ = 16×4096 = 65536 tokens，
+且 Prefill 注意力复杂度为 O(seq²)，远重于 Decode 的 O(seq)。
+
+| 排名 | 文件 | 负担 | 关键开销 |
+|:----:|------|:----:|----------|
+| 1 | `qwen3_32b_decode_scope1.py` | ★☆☆☆☆ | 16 tokens × 3 matmul（QKV 投影）+ RMSNorm |
+| 2 | `qwen3_32b_decode_scope1_tile.py` | ★☆☆☆☆ | 同 scope1，tile DSL 写法不同，计算量相同 |
+| 3 | `qwen3_32b_decode_scope3.py` | ★★☆☆☆ | 16 tokens × 4 matmul（O 投影 + gate/up/down MLP）+ SiLU + 2× RMSNorm |
+| 4 | `qwen3_32b_decode_scope2.py` | ★★☆☆☆ | 16 tokens × 注意力 O(seq)，需遍历 KV cache（最多 4096 步） |
+| 5 | `qwen3-32b.py` | ★★★☆☆ | 完整 decode 单层（scope1+2+3），16 tokens，HIDDEN=8192 |
+| 6 | `qwen3_32b_decode.py` | ★★★☆☆ | 同上，3-scope 版本 |
+| 7 | `qwen3_32b_decode_tile.py` | ★★★☆☆ | 同上，tile DSL 版本，计算量相同 |
+| 8 | `qwen3_32b_decode_mixed.py` | ★★★☆☆ | 同上，TILELET 感知版本，计算量相同 |
+| 9 | `qwen3_32b_prefill_scope1.py` | ★★★★☆ | 最多 65536 tokens × 3 matmul + RMSNorm，计算量约为 decode scope1 的 **4096 倍** |
+| 10 | `qwen3_32b_prefill_scope3.py` | ★★★★☆ | 最多 65536 tokens × 4 matmul + MLP，计算量约为 decode scope3 的 4096 倍 |
+| 11 | `qwen3_32b_prefill.py` | ★★★★★ | 完整 prefill 单层，含 O(seq²) 注意力，HIDDEN=5120 |
+| 12 | `qwen3_32b_prefill_tilelet.py` | ★★★★★ | 同上，TILELET 感知版本，计算量相同 |
+| 13 | `qwen3_32b_training_forward_and_backward.py` | ★★★★★ | 前向 + 完整反向 + 优化器 ≈ 3× 前向计算量，内存峰值最高 |
+
+> **建议**：首次测试从排名 1 开始逐步向下。scope 级测试失败时无需继续
+> 测试包含该 scope 的完整层，应先定位和修复问题。
+> Prefill 和训练任务在模拟器上耗时显著更长，可预留充足时间。
 
 ---
 
