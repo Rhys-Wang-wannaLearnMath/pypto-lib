@@ -11,7 +11,8 @@
 
 - **操作系统**：Linux（Ubuntu 20.04+ 推荐）
 - **Python**：3.10+
-- **C++ 编译器**：g++-15（或 g++）+ ninja-build
+- **C++ 编译器**：**g++-15**（必须，不能用 g++-11 等低版本替代）+ ninja-build
+- **`/tmp` 目录权限**：必须为 `1777`（`drwxrwxrwt`），否则 apt/pip 等工具无法创建临时文件
 - **不需要** NPU 硬件或 Ascend CANN 工具包
 
 ### 1.2 安装步骤（使用 uv）
@@ -23,43 +24,73 @@
 git clone https://github.com/hw-native-sys/pypto-lib.git
 cd pypto-lib
 
-# 2. 安装系统依赖
+# 2. 确保 /tmp 权限正确（权限不对会导致 apt/pip 报 "Couldn't create temporary file" 错误）
+sudo chmod 1777 /tmp
+
+# 3. 安装系统依赖
 sudo apt-get update
 sudo apt-get install -y ninja-build
-sudo apt-get install -y g++-15 || sudo apt-get install -y g++
 
-# 3. 创建 uv 虚拟环境并激活
+# 4. 安装 g++-15（必须是 15，pto-isa 头文件使用了 C++20 <format> 等特性，g++-11/12 不支持）
+#    Ubuntu 22.04 默认源没有 g++-15，需要添加 PPA：
+sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+sudo apt-get update
+sudo apt-get install -y g++-15
+#    如果安装后 g++-15 命令不可用，可能需要手动创建符号链接：
+#    sudo ln -sf /usr/bin/x86_64-linux-gnu-g++-15 /usr/bin/g++-15
+g++-15 --version   # 确认输出 15.x
+
+# 5. 创建 uv 虚拟环境并激活
 uv venv .venv --python 3.10
 source .venv/bin/activate
 
-# 4. 安装 pypto 编译器 + simpler 运行时
+# 6. 安装 pypto 编译器 + simpler 运行时
 git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+#    ⚠️ pypto 包含 ~490 个 C++ 源文件，构建需要 scikit-build-core + CMake + nanobind。
+#    在 4 核机器上首次编译可能需要 20-40 分钟，uv pip install 不显示编译进度，
+#    看起来会像"卡住"在 "Building pypto ... Preparing packages..."，实际是在编译 C++。
+#    可通过 `ps aux | grep cc1plus` 确认编译是否在进行。
+#    如果想看到编译进度，可以先手动构建：
+#      cd /tmp/pypto && cmake -B build -G Ninja && cmake --build build -j$(nproc)
+#    然后再 uv pip install。
 uv pip install /tmp/pypto
 uv pip install /tmp/pypto/runtime
 
-# 5. 安装 ptoas（汇编器，x86_64 版本，v0.25）
+# 7. 安装 ptoas（汇编器，x86_64 版本，v0.25）
 curl -L https://github.com/hw-native-sys/PTOAS/releases/download/v0.25/ptoas-bin-x86_64.tar.gz \
   -o /tmp/ptoas.tar.gz
 mkdir -p $HOME/ptoas-bin && tar -xzf /tmp/ptoas.tar.gz -C $HOME/ptoas-bin
 chmod +x $HOME/ptoas-bin/ptoas $HOME/ptoas-bin/bin/ptoas
 
-# 6. 克隆 pto-isa（固定到 CI 使用的提交）
+# 8. 克隆 pto-isa（固定到 CI 使用的提交）
 git clone https://github.com/hw-native-sys/pto-isa.git $HOME/pto-isa
 cd $HOME/pto-isa && git checkout d96c8784 && cd -
 
-# 7. 安装 Python 依赖
+# 9. 安装 Python 依赖
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install nanobind
 ```
 
 ### 1.3 设置环境变量
 
-每次打开新终端时需要设置（建议写入 `~/.bashrc`）：
+将以下内容写入 **`~/.profile`**：
 
 ```bash
+cat >> ~/.profile << 'EOF'
+
+# pypto-lib environment
 export PTOAS_ROOT=$HOME/ptoas-bin
 export PTO_ISA_ROOT=$HOME/pto-isa
+EOF
 ```
+
+写入后执行 `source ~/.profile` 使当前终端立即生效。
+
+> **为什么写 `~/.profile` 而不是 `~/.bashrc`？** Ubuntu 默认的 `~/.bashrc` 开头有
+> `[ -z "$PS1" ] && return`，非交互式 shell（如脚本、CI、IDE 内置终端的某些调用方式）
+> 会在此处直接退出，导致写在 `return` 之后的 `export` 不生效。
+> 而 `~/.profile` 在登录时执行，且 Ubuntu 的 `~/.profile` 会自动 `source ~/.bashrc`，
+> 因此只需写入 `~/.profile` 即可覆盖所有场景。
 
 同时记得激活虚拟环境：
 
@@ -254,9 +285,15 @@ golden = torch.load("data/out/out.pt")
 | 问题 | 原因 | 解决方法 |
 |---|---|---|
 | `ModuleNotFoundError: pypto` | pypto 未安装 | 重新执行 `pip install /tmp/pypto` |
-| `ptoas: command not found` | 环境变量未设置 | `export PTOAS_ROOT=$HOME/ptoas-bin` |
+| `ptoas: command not found` 或 `ptoas binary not found` | `PTOAS_ROOT` 环境变量未设置 | `export PTOAS_ROOT=$HOME/ptoas-bin` |
 | `FileNotFoundError: pto-isa` | pto-isa 未克隆或路径错误 | `export PTO_ISA_ROOT=$HOME/pto-isa` |
+| `FileNotFoundError: 'g++-15'` | g++-15 未安装 | 通过 PPA 安装，见 1.2 节步骤 4 |
+| `fatal error: format: No such file or directory` (`#include <format>`) | 使用了 g++-11 等低版本编译器（不支持 C++20 `<format>`） | 必须安装真正的 g++-15，不能用 g++-11 符号链接替代 |
+| `g++-15` 安装后 `command not found` | Ubuntu 上 g++-15 包只安装了 `x86_64-linux-gnu-g++-15`，缺少 `g++-15` 链接 | `sudo ln -sf /usr/bin/x86_64-linux-gnu-g++-15 /usr/bin/g++-15` |
+| `Couldn't create temporary file /tmp/apt.conf.xxx` | `/tmp` 目录权限不正确（不是 `1777`） | `sudo chmod 1777 /tmp` |
+| `uv pip install /tmp/pypto` 卡在 `Building pypto ... Preparing packages` | pypto 含 ~490 个 C++ 文件，编译耗时长（4 核约 20-40 分钟），不是真的卡住 | 用 `ps aux \| grep cc1plus` 确认编译在进行；或先 `cmake --build` 手动编译以查看进度 |
 | `ModuleNotFoundError: golden` | 工作目录不对 | 确保从 pypto-lib 根目录运行，或检查 `sys.path` |
+| `apt-get update` 下载极慢 | 网络问题，PPA 源在海外 | 配置 apt 代理：写入 `/etc/apt/apt.conf.d/99proxy`，内容为 `Acquire::http::Proxy "http://127.0.0.1:7890";` 和 `Acquire::https::Proxy "http://127.0.0.1:7890";`（端口根据实际代理调整） |
 | 编译超时或很慢 | 大模型编译本身耗时较长 | scope 级测试编译更快，先测试 scope 文件 |
 | FAIL 且不匹配数很少 | BF16 精度累积误差 | 属于已知现象，可尝试放宽容差确认 |
 
