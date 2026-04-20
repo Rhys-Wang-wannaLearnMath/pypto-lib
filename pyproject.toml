@@ -1,0 +1,16 @@
+[project]
+name = "pypto-lib"
+version = "0.1.0"
+description = "PyPTO examples and model implementations"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "CANN Open Software License Agreement Version 2.0"}
+
+dependencies = [
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = [
+    "nanobind",
+]
