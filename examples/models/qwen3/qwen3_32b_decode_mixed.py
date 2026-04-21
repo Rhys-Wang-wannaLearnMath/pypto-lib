@@ -804,12 +804,15 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="Path to a directory with in/*.pt + out/*.pt for fixed-input comparison")
     args = parser.parse_args()
 
     result = run(
         program=build_qwen3_single_layer_decode_program(),
         tensor_specs=build_tensor_specs(),
         golden_fn=golden_qwen3_decode,
+        golden_data=args.golden_data,
         config=RunConfig(
             rtol=2e-2,
             atol=2e-2,

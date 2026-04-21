@@ -991,12 +991,15 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     parser.add_argument("--max-seq", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="Path to a directory with in/*.pt + out/*.pt for fixed-input comparison")
     args = parser.parse_args()
 
     result = run(
         program=build_qwen3_decode_program(),
         tensor_specs=build_tensor_specs(use_max_seq=args.max_seq),
         golden_fn=golden_qwen3_decode,
+        golden_data=args.golden_data,
         config=RunConfig(
             rtol=3e-3,
             atol=3e-3,
