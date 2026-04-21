@@ -54,6 +54,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ── Helper: remove env block using fixed-string line matching ──
+remove_env_block() {
+    local file="$1"
+    # Use awk for reliable fixed-string matching (sed regex can break on special chars)
+    awk -v begin="$ENV_MARKER_BEGIN" -v end="$ENV_MARKER_END" '
+        $0 == begin { skip=1; next }
+        $0 == end   { skip=0; next }
+        !skip
+    ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
 # ── Uninstall mode ──
 if $UNINSTALL; then
     if [[ ! -f "$BASHRC" ]]; then
@@ -61,8 +72,7 @@ if $UNINSTALL; then
         exit 0
     fi
     if grep -qF "$ENV_MARKER_BEGIN" "$BASHRC"; then
-        # Remove the block between markers (inclusive)
-        sed -i "/$ENV_MARKER_BEGIN/,/$ENV_MARKER_END/d" "$BASHRC"
+        remove_env_block "$BASHRC"
         ok "Removed pypto-lib environment block from $BASHRC"
     else
         info "No pypto-lib environment block found in $BASHRC, nothing to remove."
@@ -73,6 +83,29 @@ fi
 echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
 echo -e "${BOLD}  pypto-lib NPU Environment Setup${NC}"
 echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
+echo
+
+# ============================================================================
+# Step 0: Container capability check (NPU kernel execution needs CAP_SYS_RAWIO)
+# ============================================================================
+info "Step 0: Checking container capabilities..."
+
+if [[ -f /proc/1/status ]]; then
+    cap_bnd_hex=$(grep '^CapBnd:' /proc/1/status | awk '{print $2}')
+    cap_bnd=$((16#${cap_bnd_hex}))
+    # CAP_SYS_RAWIO = bit 17
+    if (( (cap_bnd >> 17) & 1 )); then
+        ok "CAP_SYS_RAWIO present in Bounding Set"
+    else
+        warn "CAP_SYS_RAWIO (bit 17) is NOT in container Bounding Set (CapBnd: 0x$cap_bnd_hex)"
+        warn "NPU kernel execution will HANG without this capability."
+        warn "Simulator tests (-p a2a3sim) will still work."
+        warn "To fix: restart container with --privileged or --cap-add=SYS_RAWIO"
+        echo
+    fi
+else
+    info "Cannot read /proc/1/status — skipping capability check."
+fi
 echo
 
 # ============================================================================
@@ -215,10 +248,16 @@ if command -v npu-smi &>/dev/null; then
     if [[ -n "$npu_ids" ]]; then
         npu_count=$(echo "$npu_ids" | wc -l)
         npu_list=$(echo "$npu_ids" | tr '\n' ',' | sed 's/,$//')
-        ok "Found $npu_count NPU device(s): $npu_list"
-        first_npu=$(echo "$npu_ids" | head -1)
-        info "Use -d $first_npu when running tests, e.g.:"
-        info "  python examples/models/qwen3/qwen3_32b_decode_scope1.py -p a2a3 -d $first_npu"
+        ok "Found $npu_count NPU device(s) (npu-smi physical IDs: $npu_list)"
+        if [[ $npu_count -eq 1 ]]; then
+            info "Single-card server: ACL logical device ID is always 0 (regardless of physical ID)"
+            info "Use -d 0 when running tests, e.g.:"
+            info "  python examples/models/qwen3/qwen3_32b_decode_scope1.py -p a2a3 -d 0"
+        else
+            info "Multi-card server: ACL logical device IDs are 0..$(( npu_count - 1 )), mapped by ascending physical ID"
+            info "Use -d 0 for the first card, e.g.:"
+            info "  python examples/models/qwen3/qwen3_32b_decode_scope1.py -p a2a3 -d 0"
+        fi
     else
         warn "npu-smi is available but no NPU devices detected."
         warn "Check hardware and CANN driver installation."
@@ -234,12 +273,29 @@ echo
 # ============================================================================
 info "Step 4: Generating environment variable block..."
 
-ENV_BLOCK="$ENV_MARKER_BEGIN
+# Check if CANN provides set_env.sh (sets LD_LIBRARY_PATH etc.)
+CANN_SET_ENV=""
+if [[ -f "$CANN_PATH/set_env.sh" ]]; then
+    CANN_SET_ENV="source $CANN_PATH/set_env.sh"
+    ok "Will source $CANN_PATH/set_env.sh for LD_LIBRARY_PATH etc."
+fi
+
+if [[ -n "$CANN_SET_ENV" ]]; then
+    ENV_BLOCK="$ENV_MARKER_BEGIN
+export PTOAS_ROOT=$PTOAS_DIR
+export PTO_ISA_ROOT=$PTO_ISA_DIR
+export ASCEND_HOME_PATH=$CANN_PATH
+$CANN_SET_ENV
+export PATH=\$ASCEND_HOME_PATH/bin:\$PTOAS_ROOT:\$PATH
+$ENV_MARKER_END"
+else
+    ENV_BLOCK="$ENV_MARKER_BEGIN
 export PTOAS_ROOT=$PTOAS_DIR
 export PTO_ISA_ROOT=$PTO_ISA_DIR
 export ASCEND_HOME_PATH=$CANN_PATH
 export PATH=\$ASCEND_HOME_PATH/bin:\$PTOAS_ROOT:\$PATH
 $ENV_MARKER_END"
+fi
 
 echo -e "${CYAN}────────────────────────────────────────${NC}"
 echo "$ENV_BLOCK"
@@ -265,7 +321,7 @@ fi
 
 # Remove old block if present (idempotent)
 if grep -qF "$ENV_MARKER_BEGIN" "$BASHRC"; then
-    sed -i "/$ENV_MARKER_BEGIN/,/$ENV_MARKER_END/d" "$BASHRC"
+    remove_env_block "$BASHRC"
     info "Removed previous pypto-lib environment block."
 fi
 
