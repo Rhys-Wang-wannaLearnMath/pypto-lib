@@ -4,16 +4,21 @@
 及完整 decode 程序进行源码级优化机会分析。本文档不涉及代码修改，仅提供分析结论和
 优先级排序，供后续优化迭代参考。
 
+> **本文档同时覆盖满配与 binned 两类硬件**：涉及核心数的推演均以
+> **双列**（`满配 910B3：24 AIC` / `本机 910B3 Bin6：20 AIC`）展示。
+> 本机情况详见 §1.1；binned 设备的自动 `block_dim` 截断逻辑详见
+> `docs/npu_hang_diagnosis_and_fix.md`。
+
 ---
 
 ## 执行摘要
 
-| 优先级 | 编号 | 优化 | 预期收益 | 实现难度 |
+| 优先级 | 编号 | 优化 | 预期收益（满配 24 核 / 本机 18 核） | 实现难度 |
 |--------|------|------|---------|---------|
-| **P0** | **S3-1** | Gate/Up 投影融合 | GM 读取减半（~100 MB/batch_tile） | 低 |
-| P1 | S2-4 | QK+Softmax+SV per-sb 融合 | 消除 2 个全局同步屏障 | 中 |
-| P1 | S3-2/3/4 | Scope 3 三处顺序循环并行化 | 3–17x 加速各阶段 | 低 |
-| P2 | S1-2 | Q/K/V 投影并行化 (tile 版本) | ~5x 加速投影阶段 | 低 |
+| **P0** | **S3-1** | Gate/Up 投影融合 | GM 读取减半（~100 MB/batch_tile，与核心数无关） | 低 |
+| P1 | S2-4 | QK+Softmax+SV per-sb 融合 | 消除 2 个全局同步屏障（与核心数无关） | 中 |
+| P1 | S3-2/3/4 | Scope 3 三处顺序循环并行化 | 满配 3–17x / 本机 ~2.7–14x | 低 |
+| P2 | S1-2 | Q/K/V 投影并行化 (tile 版本) | 满配 ~5x / 本机 ~4x | 低 |
 | P2 | S2-1/2 | Batch / Group 循环并行化 | 短 ctx_len 时收益显著 | 低 |
 | P3 | S1-1 | K_CHUNK 标准化 | 视编译器行为 | 低 |
 | P3 | X-1 | Scope 1 输出精度降低 | 减 50% 跨 scope 带宽 | 低（需精度验证） |
@@ -24,6 +29,7 @@
 ## 目录
 
 1. [硬件约束速查](#1-硬件约束速查)
+   - [1.1 本机 Binned 设备影响说明](#11-本机-binned-设备影响说明)
 2. [文件结构与版本关系](#2-文件结构与版本关系)
 3. [Scope 1 — RMSNorm + Q/K/V 投影](#3-scope-1--rmsnorm--qkv-投影)
 4. [Scope 2 — RoPE + KV Cache + Attention](#4-scope-2--rope--kv-cache--attention)
@@ -37,21 +43,69 @@
 ## 1. 硬件约束速查
 
 以下为 Ascend 910B 处理器的关键资源约束，所有优化方案均需在此框架内验证可行性。
+**单核资源（UB/L1/L0A/L0B/L0C）在满配与 binned 设备上完全相同**；仅核心数和
+`block_dim` 因 binning 而变化。
 
-| 资源 | 容量 | 约束说明 |
-|------|------|---------|
-| **TILELET** (Vector) | **2 KB** (2048 B) | 每个 vector 操作数（add/mul/exp/rsqrt 等）≤ 2048 B |
-| **TILE** (Cube) | **16 KB** (16384 B) | 每个 matmul 操作数 ≤ 16384 B |
-| **Vec (UB)** | 192 KB | AIV（vector 核心）的工作缓冲区 |
-| **Mat (L1)** | 512 KB | AIC（cube 核心）的矩阵缓冲区 |
-| **L0A** | 64 KB | Cube 单元的左矩阵输入寄存器文件 |
-| **L0B** | 64 KB | Cube 单元的右矩阵输入寄存器文件 |
-| **Acc (L0C)** | 128 KB | Cube 单元的累加器 |
-| **AIC 核心数** | 24 | cube 矩阵计算单元（core_id 0–23） |
-| **AIV 核心数** | 24 | vector 向量计算单元（core_id 24–47） |
-| **AICPU 线程** | 4 | 3 个调度器线程 + 1 个编排器线程 |
+| 资源 | 满配 910B3 | 本机 910B3 Bin6 | 约束说明 |
+|------|:---:|:---:|---------|
+| **TILELET** (Vector) | **2 KB** (2048 B) | 同左 | 每个 vector 操作数（add/mul/exp/rsqrt 等）≤ 2048 B |
+| **TILE** (Cube) | **16 KB** (16384 B) | 同左 | 每个 matmul 操作数 ≤ 16384 B |
+| **Vec (UB)** | 192 KB | 同左 | AIV（vector 核心）的工作缓冲区 |
+| **Mat (L1)** | 512 KB | 同左 | AIC（cube 核心）的矩阵缓冲区 |
+| **L0A** | 64 KB | 同左 | Cube 单元的左矩阵输入寄存器文件 |
+| **L0B** | 64 KB | 同左 | Cube 单元的右矩阵输入寄存器文件 |
+| **Acc (L0C)** | 128 KB | 同左 | Cube 单元的累加器 |
+| **AIC 核心数** | **24** | **20** | cube 矩阵计算单元（core_id 0–23 / 0–19） |
+| **AIV 核心数** | **24** | **20** | vector 向量计算单元（core_id 24–47 / 24–43） |
+| **AICPU 线程** | 4 | 4 | 3 个调度器线程 + 1 个编排器线程 |
+| **有效 `block_dim`** | **24** | **18** | 须被 `scheduler_thread_num`(=3) 整除，详见 §1.1 |
 
 > 详见 `docs/performance_analysis_guide.md` 第 5 节"内存使用指标"。
+
+---
+
+## 1.1 本机 Binned 设备影响说明
+
+### 设备辨识
+
+本机实测参数：
+
+| 项 | 值 | 取值来源 |
+|----|----|---------|
+| 板卡型号 | `IT21HMDA_Bin6` | `npu-smi info` |
+| Board ID | `0x62` | — |
+| AICore 集群数 | **20** | `rtGetAiCoreCount()` |
+| 物理握手核数 | 60（= 20 × 3，每 cluster 1 AIC + 2 AIV 硬件） | device log `handshake_all_cores` |
+| Profiler 逻辑核数 | 40（= 20 AIC + 20 AIV，1:1 映射） | `core_to_thread` |
+
+### `block_dim` 自动截断规则
+
+pypto 运行时会在 `execute_on_device()` 入口处自动执行：
+
+1. 调用 `rtGetAiCoreCount()` 查询实际 AIC 数量 `hw_max`
+2. 若用户/默认 `block_dim > hw_max`，则截断至
+   `new_bd = ⌊hw_max / scheduler_thread_num⌋ × scheduler_thread_num`
+3. `scheduler_thread_num = aicpu_thread_num − 1`（一个线程留给 orchestrator）
+
+对本机：`aicpu_thread_num=4` → `scheduler_thread_num=3`，
+`hw_max=20` → `new_bd = (20 // 3) × 3 = 18`，因此 **本机一切样例均以 `block_dim=18` 实际运行**。
+
+### 对并行度的直接影响
+
+- **一轮处理块数**：24 → **18**（满配 → 本机）
+- **并行化优化的等效加速比**：满配 `⌈N/24⌉` → 本机 `⌈N/18⌉`
+- **对收益排序不造成结构性变化**：并行化收益略降（~75%），但排序相对不变
+
+### 对 GM 带宽 / 内存的影响
+
+- 单次并行"扇出"的工作集从 24 份减为 18 份（-25%），瞬时 GM 带宽需求略降
+- 与核心数**无关**的优化（如 S3-1 融合、S2-4 屏障消除）在本机与满配收益完全相同
+- 硬件约束表（Mat/UB/L0*/Acc 容量）在本机与满配**完全相同**，所有"硬件约束检查"段落无需重算
+
+### 交叉引用
+
+- Hang 诊断与修复细节：`docs/npu_hang_diagnosis_and_fix.md`
+- `block_dim` 自动截断代码：`python/pypto/runtime/device_runner.py` 的 `execute_on_device()`
 
 ---
 
@@ -160,8 +214,14 @@ for ob in pl.range(kv_out_blocks):      # 顺序，kv_out_blocks=16
 
 **优化方向**：改用 `pl.parallel` 或添加 `chunk` 参数。
 
-**预期收益**：Q 投影 128 个 block 可分配到 24 个 AIC 核心并行执行，理论加速约 5x
-（128 / 24 ≈ 6 轮，vs 128 轮顺序）。K/V 投影 16 个 block 也可在 1 轮内完成。
+**预期收益（双列推演）**：
+
+| 阶段 | N blocks | 满配（24 核）轮数 | 本机（18 核）轮数 | 满配加速比 | 本机加速比 |
+|------|:---:|:---:|:---:|:---:|:---:|
+| Q 投影 | 128 | `⌈128/24⌉` = 6 | `⌈128/18⌉` = **8** | ~21x | **~16x** |
+| K/V 投影 | 16 | 1（16<24） | 1（16<18） | — | — |
+
+Q 投影 128 blocks 可并行到所有 AIC；K/V 投影 16 blocks 均在单轮内完成（两种配置下都不饱和）。
 
 **正确性风险**：**极低**。每个 output block 只写入 `q_proj[b0, q0:q0+Q_OUT_CHUNK]`，
 区域不重叠。
@@ -205,11 +265,15 @@ k_cache/v_cache 的不同区域），但 batch 循环是顺序的。
 **优化方向**：`for b in pl.range(batch)` → `for b in pl.range(batch, parallel=True)`
 或使用 `chunk`。
 
-**预期收益**：
+**预期收益（双列推演）**：
 - 每个 batch item 内部已有 `pl.parallel` 循环（QK/softmax/SV 的 `sb` 维度），
-  当 `ctx_blocks` 较大时（长 ctx_len），内部并行度已饱和 24 个核心。
-- 但当 `ctx_len` 较短时（如 ctx_blocks < 24），内部并行度不足，
+  当 `ctx_blocks` 较大时（长 ctx_len），内部并行度已饱和核心：
+  - 满配：`ctx_blocks ≥ 24` 时饱和
+  - **本机：`ctx_blocks ≥ 18` 时饱和**（饱和阈值降低，利好短 ctx）
+- 当 `ctx_len` 较短（`ctx_blocks < 18/24`）时，内部并行度不足，
   此时 batch 并行可显著提升核心利用率。
+- 具体数值：batch=16，若 `ctx_blocks=8`，满配有 16 空闲核心，本机有 10 空闲核心；
+  两种配置下 batch 并行均能把有效并行度拉到 `min(batch × ctx_blocks, cores)`。
 
 **风险**：batch 并行需要所有 batch item 的中间张量
 （`all_raw_scores`, `all_exp_padded`, `all_oi_tmp`, `all_cur_mi`, `all_cur_li`）
@@ -232,7 +296,13 @@ for gi in pl.range(total_q_groups):  # 顺序，total_q_groups=8
 
 **优化方向**：`for gi in pl.range(total_q_groups)` → 添加 `parallel=True`。
 
-**预期收益**：与 S2-1 类似，短 ctx_len 时收益明显。
+**预期收益（双列推演）**：
+- `total_q_groups=8`，两种配置下都不饱和单轮（8 < 18 < 24），因此 8 个 group 在满配和本机都**单轮完成**
+- 单独看此优化：满配加速 ~8x，本机加速 ~8x（相同）
+- 但与 S2-1 batch 并行组合（batch × group = 16 × 8 = 128 工作单元）时：
+  - 满配：`⌈128/24⌉` = 6 轮
+  - **本机：`⌈128/18⌉` = 8 轮**
+  - 短 ctx_len 时两种配置收益都明显
 
 **正确性风险**：**低**。每个 group 写入 `attn_row` 的不同列区域
 （`q_base * head_dim` 起始的 `Q_HEAD_BATCH * head_dim` 列），不重叠。
@@ -329,6 +399,10 @@ with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
 不必要的全局同步。Stage 5 (online softmax accumulation) 仍然独立执行，
 依赖关系不受影响。
 
+**Binned 设备影响**：此优化的收益来自**同步屏障消除**和**L1 中间结果复用**，
+与核心数**无关**。本机（18 核）与满配（24 核）收益完全相同；
+硬件约束检查表中的 Mat 峰值（~36 KB）在两种配置下都远低于 L1 容量（512 KB）。
+
 ---
 
 ## 5. Scope 3 — Output Projection + MLP
@@ -421,6 +495,10 @@ for ob in pl.range(MLP_OUT_BLOCKS):
 **正确性风险**：**极低**。gate 和 up 投影使用同一 `post_norm_tile` chunk 的只读数据，
 matmul 操作序列完全不变，只是共享了输入数据的 L1 副本。数学上严格等价。
 
+**Binned 设备影响**：此优化的收益来自**GM 读取量减半**（每 output block 从 512 KB 降到 256 KB），
+与核心数**无关**。本机（18 核）与满配（24 核）节省量完全相同（每 batch_tile ~100 MB）；
+硬件约束验证表中的单核资源使用量（L0A/L0B/L0C/L1）在两种配置下都保持不变。
+
 ---
 
 ### 5.2 优化机会 S3-2：Output Projection 顺序循环
@@ -444,8 +522,12 @@ for ob in pl.range(Q_OUT_BLOCKS):  # 顺序，Q_OUT_BLOCKS = 8192 // 64 = 128
 
 **优化方向**：`pl.range(Q_OUT_BLOCKS)` → `pl.parallel(Q_OUT_BLOCKS, chunk=...)`
 
-**预期收益**：128 blocks / 24 cores ≈ 6 轮（vs 128 轮顺序），约 **~20x** 理论加速
-（受调度开销和 L1 带宽限制，实际约 5x）。
+**预期收益（双列推演）**：
+
+| 配置 | 核心数 | 轮数 | 理论加速比 | 实际加速比（受调度/带宽限制） |
+|------|:---:|:---:|:---:|:---:|
+| 满配 | 24 | `⌈128/24⌉` = 6 | ~21x | ~5x |
+| **本机** | **18** | `⌈128/18⌉` = **8** | **~16x** | **~4x** |
 
 **注意**：`resid1_tile` 后续被 RMSNorm 读取，需要所有 output block 完成。
 parallel 在 output projection 阶段结束后自然形成同步点，因此安全。
@@ -464,9 +546,14 @@ for ob in pl.range(MLP_OUT_BLOCKS):  # 顺序
 
 **分析**：MLP_OUT_BLOCKS 个 output block 独立写入 `mlp_tile` 的不同列区域。
 
-**预期收益**：
-- MLP_OUT_CHUNK=64 → 400 blocks / 24 cores ≈ 17 轮（vs 400 顺序）
-- MLP_OUT_CHUNK=256 → 100 blocks / 24 cores ≈ 5 轮（vs 100 顺序）
+**预期收益（双列推演）**：
+
+| 配置 | 核心数 | MLP_OUT_CHUNK=64 (400 blocks) | MLP_OUT_CHUNK=256 (100 blocks) |
+|------|:---:|:---:|:---:|
+| 满配 | 24 | `⌈400/24⌉` = 17 轮（~24x） | `⌈100/24⌉` = 5 轮（~20x） |
+| **本机** | **18** | `⌈400/18⌉` = **23 轮（~17x）** | `⌈100/18⌉` = **6 轮（~17x）** |
+
+对应顺序循环数：400 / 100 轮。**本机加速比相对满配略降（~75%）**，但绝对收益仍然显著。
 
 ---
 
@@ -483,7 +570,14 @@ for dob in pl.range(HIDDEN_BLOCKS):  # 顺序，HIDDEN_BLOCKS = 8192 // 128 = 64
 
 **分析**：64 个 down output block 独立写入 `out` 的不同列区域。
 
-**预期收益**：64 blocks / 24 cores ≈ 3 轮（vs 64 顺序），约 **~3x** 加速。
+**预期收益（双列推演）**：
+
+| 配置 | 核心数 | 轮数 | 理论加速比 |
+|------|:---:|:---:|:---:|
+| 满配 | 24 | `⌈64/24⌉` = 3 | ~21x |
+| **本机** | **18** | `⌈64/18⌉` = **4** | **~16x** |
+
+对应顺序 64 轮。
 
 ---
 
@@ -552,23 +646,32 @@ Scope 间无法并行。但如果 batch 维度可以 pipeline：
 
 ## 7. 优化优先级排序
 
-按 **预期收益 / 实现风险** 比排序：
+按 **预期收益 / 实现风险** 比排序。**收益列已拆为"满配 24 核 / 本机 18 核"双列**。
 
-| 优先级 | 编号 | 优化 | 预期收益 | 实现难度 | 正确性风险 | 所需验证 |
-|--------|------|------|---------|---------|-----------|---------|
-| **P0** | **S3-1** | **Gate/Up 投影融合** | **高：GM 读取减半 (~100 MB)** | **低** | **极低** | golden 对比 |
-| P1 | S2-4 | QK+Softmax+SV per-sb 融合 | 高：消除 2 个同步屏障 | 中 | 低 | golden 对比 + 多输入 |
-| P1 | S3-2 | Output Projection 并行化 | 中高：~5x 该阶段 | 低 | 极低 | golden 对比 |
-| P1 | S3-3 | MLP Output Block 并行化 | 中高：~17x 该阶段 | 低 | 极低 | golden 对比 |
-| P1 | S3-4 | Down Projection 并行化 | 中：~3x 该阶段 | 低 | 极低 | golden 对比 |
-| P2 | S1-2 | Q/K/V 投影并行化 (tile) | 中：~5x 该阶段 | 低 | 极低 | golden 对比 |
-| P2 | S2-1 | Batch 循环并行化 | 中（短 ctx_len 高） | 低 | 低 | 多输入 + 边界测试 |
-| P2 | S2-2 | Group 循环并行化 | 中（短 ctx_len 高） | 低 | 低 | 多输入 |
-| P3 | S1-1 | K_CHUNK 标准化 | 低~中 | 低 | 低 | profiling |
-| P3 | X-1 | Scope 1 输出精度降低 | 低~中 | 低 | 中 | 精度验证 |
-| P4 | X-3 | 跨 Scope Pipeline | 高 | 高 | 中 | 框架支持 |
-| — | S1-3 | RMSNorm 两次遍历 | 无 | — | — | — |
-| — | S2-3 | max_ctx_blocks 张量分配 | 无（框架限制） | — | — | — |
+| 优先级 | 编号 | 优化 | 满配（24 核）收益 | 本机（18 核）收益 | 实现难度 | 正确性风险 | 所需验证 |
+|--------|------|------|------------------|------------------|---------|-----------|---------|
+| **P0** | **S3-1** | **Gate/Up 投影融合** | **高：GM 读取减半 (~100 MB)** | **同左（与核心数无关）** | **低** | **极低** | golden 对比 |
+| P1 | S2-4 | QK+Softmax+SV per-sb 融合 | 高：消除 2 个同步屏障 | 同左（与核心数无关） | 中 | 低 | golden 对比 + 多输入 |
+| P1 | S3-3 | MLP Output Block 并行化 | 中高：~17–20x 该阶段 | **中高：~17x 该阶段（chunk=64/256 差异小）** | 低 | 极低 | golden 对比 |
+| P1 | S3-2 | Output Projection 并行化 | 中高：~21x 该阶段 | **中高：~16x 该阶段** | 低 | 极低 | golden 对比 |
+| P1 | S3-4 | Down Projection 并行化 | 中：~21x 该阶段 | **中：~16x 该阶段** | 低 | 极低 | golden 对比 |
+| P2 | S1-2 | Q/K/V 投影并行化 (tile) | 中：~21x Q 投影 | **中：~16x Q 投影（K/V 两种配置都单轮完成）** | 低 | 极低 | golden 对比 |
+| P2 | S2-1 | Batch 循环并行化 | 中（短 ctx_len 高） | **中（短 ctx_len 饱和阈值更低：18 vs 24）** | 低 | 低 | 多输入 + 边界测试 |
+| P2 | S2-2 | Group 循环并行化 | 中（短 ctx_len 高） | 同左（8 group 两配置单轮完成） | 低 | 低 | 多输入 |
+| P3 | S1-1 | K_CHUNK 标准化 | 低~中 | 同左（编译器行为） | 低 | 低 | profiling |
+| P3 | X-1 | Scope 1 输出精度降低 | 低~中 | 同左（与核心数无关） | 低 | 中 | 精度验证 |
+| P4 | X-3 | 跨 Scope Pipeline | 高 | 同左（框架层） | 高 | 中 | 框架支持 |
+| — | S1-3 | RMSNorm 两次遍历 | 无 | — | — | — | — |
+| — | S2-3 | max_ctx_blocks 张量分配 | 无（框架限制） | — | — | — | — |
+
+### 7.1 Binned 设备的排序变化观察
+
+- **排序相对不变**：P0/P1/P2 分层与编号次序完全保持
+- **加速比规律**：所有并行化类优化（S1-2, S3-2/3/4）在本机降为满配的 **~75%**（= 18/24），
+  因为一轮可完成的 block 数从 24 变为 18
+- **与核心数无关的优化（S3-1, S2-4, X-1）收益不变**，在 binned 设备上**相对吸引力更高**
+- **对 S2-1/S2-2 有潜在利好**：本机内部并行饱和阈值从 `ctx_blocks=24` 降至 `ctx_blocks=18`，
+  意味着更多短 ctx 场景可以"单层并行"即饱和，batch 并行相对收益更小
 
 ---
 
@@ -611,3 +714,39 @@ Scope 间无法并行。但如果 batch 维度可以 pipeline：
 | 每 output block post_norm_tile GM 读取 | 512 KB (2×) | 256 KB (1×) | 256 KB |
 | MLP_OUT_BLOCKS=400 总读取 | 200 MB | 100 MB | **100 MB** |
 | MLP_OUT_BLOCKS=100 总读取 | 50 MB | 25 MB | **25 MB** |
+
+> 本项收益与核心数**无关**，满配（24）与本机（18）相同。
+
+### A.4 block_dim 对本机的影响速查
+
+本机 `block_dim` 经自动截断后为 **18**，对所有"N blocks 并行"段的推演影响汇总：
+
+| 优化点 | N blocks | 满配（24）轮数 | 本机（18）轮数 | 轮数比 | 本机加速比 / 满配加速比 |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| S1-2 Q 投影 | 128 | 6 | 8 | 1.33x | 0.75 |
+| S1-2 K/V 投影 | 16 | 1 | 1 | 1.0x | 1.0（两配置均单轮） |
+| S3-2 Output Proj | 128 | 6 | 8 | 1.33x | 0.75 |
+| S3-3 MLP Out (chunk=64) | 400 | 17 | 23 | 1.35x | 0.74 |
+| S3-3 MLP Out (chunk=256) | 100 | 5 | 6 | 1.20x | 0.83 |
+| S3-4 Down Proj | 64 | 3 | 4 | 1.33x | 0.75 |
+
+**一般规律**：`本机轮数 / 满配轮数 = ⌈N/18⌉ / ⌈N/24⌉`；
+当 `N ≡ 0 (mod 24)` 且 `N ≡ 0 (mod 18)` 时，比值严格等于 `4/3 ≈ 1.333`。
+其余场景比值在 `1.0 ~ 1.33` 之间波动，取决于余数。
+
+**如何解读本文档的数值**：
+- 若你在**满配设备**运行：以"满配"列为准
+- 若你在**本机或其它 binned 设备**运行：以"本机"列为准，或套用 `⌈N / block_dim⌉` 公式自行推演
+- 核心数**无关的**优化（S3-1 / S2-4 / X-1）无需换算
+
+**若迁移到其它 binned 型号**：将 `rtGetAiCoreCount()` 返回值代入上述公式重算即可。
+常见 910B 系列 AICore 数（典型值）：
+
+| 型号 | AIC 集群数 | 对齐后 `block_dim` | 与满配比 |
+|------|:---:|:---:|:---:|
+| 910B1（满配） | 24 | 24 | 100% |
+| 910B3 Bin6（本机） | 20 | 18 | 75% |
+| 910B3 Bin8（假设） | 16 | 15 | 62.5% |
+| 910B3 Bin10（假设） | 12 | 12 | 50% |
+
+> 具体 bin 型号对应核心数以实际 `rtGetAiCoreCount()` 返回为准。

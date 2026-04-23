@@ -28,8 +28,11 @@ EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
 
 K_CHUNK = 128
-Q_OUT_CHUNK = 64
-MLP_OUT_CHUNK = 64
+# [OPT v3] Doubled tile widths for better Cube fractal utilization:
+# L0B: [128,128]×2B = 32KB (50%) vs [128,64]×2B = 16KB (25%)
+# Halves iteration count: 400→200 MLP blocks, 128→64 output blocks
+Q_OUT_CHUNK = 128
+MLP_OUT_CHUNK = 128
 BATCH_TILE = 16
 
 
@@ -47,7 +50,7 @@ def build_qwen3_scope3_program(
     MLP_OUT_BLOCKS = INTER_CFG // MLP_OUT_CHUNK
 
     @pl.program
-    class Qwen3Scope3:
+    class Qwen3Scope3_OPT:
         @pl.function(type=pl.FunctionType.Opaque)
         def scope3(
             self,
@@ -104,22 +107,29 @@ def build_qwen3_scope3_program(
                         normed_bf16 = pl.cast(normed, target_type=pl.BF16)
                         post_norm_tile = pl.assemble(post_norm_tile, normed_bf16, [0, k0])
 
-                # Stage 3 & 4 & 5: MLP: gate/up projections (fused) + SiLU.
+                # Stage 3 & 4 & 5: MLP: gate/up projections + SiLU.
+                # [OPT v3] Separate gate/up for perfect inter-iteration overlap.
                 mlp_tile = pl.create_tensor([BATCH_TILE, INTER_CFG], dtype=pl.BF16)
                 for ob in pl.range(MLP_OUT_BLOCKS):
                     o0 = ob * MLP_OUT_CHUNK
                     with pl.at(level=pl.Level.CORE_GROUP):
                         post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
-                        wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                         gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
-                        up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
                         for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                            wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
+
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
+                        up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
 
                     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
@@ -152,7 +162,7 @@ def build_qwen3_scope3_program(
 
             return out
 
-    return Qwen3Scope3
+    return Qwen3Scope3_OPT
 
 
 def golden(tensors):
@@ -246,7 +256,6 @@ def build_tensor_specs(
 if __name__ == "__main__":
     import argparse
     import sys
-    from datetime import datetime
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -270,10 +279,7 @@ if __name__ == "__main__":
         config=RunConfig(
             rtol=3e-3,
             atol=3e-3,
-            compile=dict(
-                dump_passes=True,
-                output_dir=f"build_output/Qwen3Scope3_fused_gate_up_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            ),
+            compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,

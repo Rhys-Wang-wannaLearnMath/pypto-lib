@@ -34,6 +34,37 @@ if [[ -f "$HOME/.profile" ]]; then
     source "$HOME/.profile" 2>/dev/null || true
 fi
 
+# ── 加载 CANN 工具链环境（ccec 编译器等） ──
+# ~/.profile 可能将 ASCEND_HOME_PATH 设置为 Ascend 安装根目录而非版本子目录，
+# 导致找不到 ccec。优先 source CANN 官方 set_env.sh 来修正。
+_CANN_SET_ENV="${ASCEND_HOME_PATH:-$HOME/Ascend}/cann-8.5.0/set_env.sh"
+if [[ ! -f "$_CANN_SET_ENV" ]]; then
+    # 如果 ASCEND_HOME_PATH 已指向版本目录，直接用它
+    _CANN_SET_ENV="${ASCEND_HOME_PATH:-$HOME/Ascend}/set_env.sh"
+fi
+if [[ -f "$_CANN_SET_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$_CANN_SET_ENV" 2>/dev/null || true
+fi
+unset _CANN_SET_ENV
+
+# ── 验证关键环境变量 ──
+_missing=()
+[[ -z "${ASCEND_HOME_PATH:-}" ]] && _missing+=(ASCEND_HOME_PATH)
+[[ -z "${PTOAS_ROOT:-}" ]]       && _missing+=(PTOAS_ROOT)
+[[ -z "${PTO_ISA_ROOT:-}" ]]     && _missing+=(PTO_ISA_ROOT)
+if [[ ${#_missing[@]} -gt 0 ]]; then
+    echo "ERROR: 缺少环境变量: ${_missing[*]}"
+    echo "请设置后重试，或检查 ~/.profile 和 CANN set_env.sh"
+    exit 1
+fi
+if [[ ! -f "$ASCEND_HOME_PATH/bin/ccec" ]]; then
+    echo "ERROR: ccec 编译器不存在: $ASCEND_HOME_PATH/bin/ccec"
+    echo "请检查 ASCEND_HOME_PATH=$ASCEND_HOME_PATH 是否指向正确的 CANN 版本目录"
+    exit 1
+fi
+unset _missing
+
 # ── 解析参数 ──
 PLATFORM="a2a3sim"
 PROFILING=false

@@ -26,8 +26,7 @@ INTERMEDIATE = 25600
 EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
 
-# Vector TILELET budget (2 KB = 2048 B, FP32 = 4 B/elem):
-K_CHUNK = 128
+K_CHUNK = 512
 Q_OUT_CHUNK = 64
 KV_OUT_CHUNK = 64
 MLP_OUT_CHUNK = 64
@@ -47,7 +46,7 @@ def build_qwen3_scope1_program(
     kv_out_blocks = kv_hidden // KV_OUT_CHUNK
 
     @pl.program
-    class Qwen3Scope1:
+    class Qwen3Scope1_OPT:
         @pl.function(type=pl.FunctionType.Opaque)
         def qwen3_scope1(
             self,
@@ -147,7 +146,7 @@ def build_qwen3_scope1_program(
 
             return q_proj, k_proj, v_proj
 
-    return Qwen3Scope1
+    return Qwen3Scope1_OPT
 
 
 def build_tensor_specs(
@@ -251,8 +250,6 @@ if __name__ == "__main__":
                         help="Path to a directory with in/*.pt + out/*.pt for fixed-input comparison")
     args = parser.parse_args()
 
-    from datetime import datetime
-
     result = run(
         program=build_qwen3_scope1_program(),
         tensor_specs=build_tensor_specs(),
@@ -261,10 +258,7 @@ if __name__ == "__main__":
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,
-            compile=dict(
-                dump_passes=True,
-                output_dir=f"build_output/Qwen3Scope1_K128_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            ),
+            compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,

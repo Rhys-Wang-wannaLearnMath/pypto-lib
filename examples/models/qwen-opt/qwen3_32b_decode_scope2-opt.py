@@ -50,7 +50,7 @@ def build_qwen3_scope2_program(
     max_ctx_blocks = (max_seq + SEQ_TILE - 1) // SEQ_TILE
 
     @pl.program
-    class Qwen3Scope2:
+    class Qwen3Scope2_OPT:
         @pl.function(type=pl.FunctionType.Opaque)
         def qwen3_scope2(
             self,
@@ -64,22 +64,16 @@ def build_qwen3_scope2_program(
             v_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
             attn_out: pl.Out[pl.Tensor[[batch, hidden], pl.BF16]],
         ) -> pl.Tensor[[batch, hidden], pl.BF16]:
-            # Round-2 layout:
-            #   S2-A4     — per-gi `q_padded` (no global `all_q_padded`).
-            #   S2-A2     — `for gi in pl.parallel(total_q_groups)` (kept from round 1).
-            #   Stage 1   — `pl.parallel(num_kv_heads, chunk=8) + chunked_loop_optimizer`
-            #                fuses 8 per-head K RoPE + V cache writes into a single AIV
-            #                kernel invocation per batch (vs. round 1's 16-task per-b
-            #                unfused loop).
-            #   Stages 2/3/4 — restored `pl.parallel(ctx_blocks, chunk=SB_BATCH) +
-            #                   chunked_loop_optimizer` with per-gi GM staging tensors
-            #                   (`all_raw_scores` / `all_exp_padded` / `all_oi_tmp` /
-            #                   `all_cur_mi` / `all_cur_li`). This collapses the round 1
-            #                   sb-level task explosion (3928 → ~128 per stage).
-            #   Stage 5   — sequential `pl.range` online-softmax merge + normalise +
-            #                write to per-batch `attn_row`.
-            # Per-head `pl.slice` on `k_proj`/`q_proj`/`v_proj`/cos/sin is preserved to
-            # satisfy the A2/A3 `textract src=mat` constraint (see first-round errors).
+            # Padding q
+            all_q_padded = pl.create_tensor([batch * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                for idx in pl.range(batch * total_q_groups):
+                    all_q_padded = pl.assemble(
+                        all_q_padded,
+                        pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
+                        [idx * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
+                    )
+
             for b in pl.range(batch):
                 ctx_len = pl.tensor.read(seq_lens, [b])
                 pos = ctx_len - 1
@@ -91,10 +85,10 @@ def build_qwen3_scope2_program(
                 sin_lo = pl.slice(sin_row, [1, half_dim], [0, 0])
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
-                # Stage 1: per-head K RoPE + K/V cache write, batched into one
-                # AIV task per batch via chunked_loop_optimizer.
+                # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                     for ki in pl.parallel(0, num_kv_heads, chunk=8):
+                        # K RoPE + cache update.
                         kv_col = ki * head_dim
                         k_lo = pl.slice(k_proj, [1, half_dim], [b, kv_col])
                         k_hi = pl.slice(k_proj, [1, half_dim], [b, kv_col + half_dim])
@@ -117,6 +111,7 @@ def build_qwen3_scope2_program(
                             pl.cast(rot_hi, target_type=pl.BF16),
                             [cache_row, half_dim],
                         )
+                        # V cache update.
                         v_cache = pl.assemble(
                             v_cache,
                             pl.cast(
@@ -125,21 +120,8 @@ def build_qwen3_scope2_program(
                             ),
                             [cache_row, 0],
                         )
-
-                # Per-batch BF16 scratch for grouped-query attention output.
-                attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
-
-                for gi in pl.parallel(total_q_groups):
-                    kvh = gi // q_groups
-                    qg = gi - kvh * q_groups
-                    q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
-
-                    # Stage 2a: per-gi `q_padded` + per-head Q RoPE (S2-A4).
-                    # Pad rows [Q_HEAD_BATCH:Q_HEAD_PAD] are left as uninitialised
-                    # BF16 scratch and are never read by softmax (it slices only
-                    # the first Q_HEAD_BATCH rows of raw_scores).
-                    q_padded = pl.create_tensor([Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                        # Q RoPE + pad (ki == kvh since q_groups == 1).
+                        q_base = ki * q_per_kv
                         for qi in pl.range(Q_HEAD_BATCH):
                             q_col = (q_base + qi) * head_dim
                             q_lo = pl.slice(q_proj, [1, half_dim], [b, q_col])
@@ -158,28 +140,22 @@ def build_qwen3_scope2_program(
                                 ),
                                 target_type=pl.BF16,
                             )
-                            q_padded = pl.assemble(q_padded, rot_lo_bf16, [qi, 0])
-                            q_padded = pl.assemble(q_padded, rot_hi_bf16, [qi, half_dim])
+                            all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + qi, 0])
+                            all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + qi, half_dim])
 
-                    # Per-gi GM staging tensors (upper-bound-sized via max_ctx_blocks).
-                    all_raw_scores = pl.create_tensor(
-                        [max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32
-                    )
-                    all_exp_padded = pl.create_tensor(
-                        [max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16
-                    )
-                    all_oi_tmp = pl.create_tensor(
-                        [max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32
-                    )
-                    all_cur_mi = pl.create_tensor(
-                        [max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32
-                    )
-                    all_cur_li = pl.create_tensor(
-                        [max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32
-                    )
+                attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
+                for gi in pl.range(total_q_groups):
+                    kvh = gi // q_groups
+                    qg = gi - kvh * q_groups
+                    q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
+                    q_padded = pl.slice(all_q_padded, [Q_HEAD_PAD, head_dim], [b * total_q_groups * Q_HEAD_PAD + gi * Q_HEAD_PAD, 0])
 
-                    # Stage 2: QK matmul — parallel over sb, chunked into 1 AIC task
-                    # per gi via chunked_loop_optimizer (SB_BATCH = max_ctx_blocks).
+                    # Stage 2: QK matmul for all active sb blocks.
+                    all_raw_scores = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32)
+                    all_exp_padded = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
+                    all_oi_tmp = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
+                    all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
+                    all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
                     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                             s0 = sb * SEQ_TILE
@@ -189,14 +165,10 @@ def build_qwen3_scope2_program(
                                 [SEQ_TILE, head_dim],
                                 [cache_row0, 0],
                             )
-                            raw_scores = pl.matmul(
-                                q_padded, k_tile, b_trans=True, out_dtype=pl.FP32
-                            )
-                            all_raw_scores = pl.assemble(
-                                all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0]
-                            )
+                            raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
+                            all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0])
 
-                    # Stage 3: Softmax — parallel over sb (AIV).
+                    # Stage 3: softmax for all active sb blocks.
                     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                             s0 = sb * SEQ_TILE
@@ -207,26 +179,18 @@ def build_qwen3_scope2_program(
                                 [sb * Q_HEAD_PAD, 0],
                                 valid_shape=[Q_HEAD_BATCH, valid_len],
                             )
-                            scores_padded = pl.fillpad(
-                                scores_valid, pad_value=pl.PadValue.min
-                            )
+                            scores_padded = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
                             scores = pl.mul(scores_padded, attn_scale)
                             cur_mi = pl.row_max(scores)
                             exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
                             exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
                             exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
                             cur_li = pl.row_sum(exp_scores_fp32)
-                            all_exp_padded = pl.assemble(
-                                all_exp_padded, exp_scores_bf16, [sb * Q_HEAD_PAD, 0]
-                            )
-                            all_cur_mi = pl.assemble(
-                                all_cur_mi, cur_mi, [sb * Q_HEAD_BATCH, 0]
-                            )
-                            all_cur_li = pl.assemble(
-                                all_cur_li, cur_li, [sb * Q_HEAD_BATCH, 0]
-                            )
+                            all_exp_padded = pl.assemble(all_exp_padded, exp_scores_bf16, [sb * Q_HEAD_PAD, 0])
+                            all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [sb * Q_HEAD_BATCH, 0])
+                            all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_BATCH, 0])
 
-                    # Stage 4: SV matmul — parallel over sb (AIC).
+                    # Stage 4: SV matmul for all active sb blocks.
                     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                             s0 = sb * SEQ_TILE
@@ -242,49 +206,36 @@ def build_qwen3_scope2_program(
                                 [cache_row0, 0],
                             )
                             oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
-                            all_oi_tmp = pl.assemble(
-                                all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0]
-                            )
+                            all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
-                    # Stage 5: sequential online-softmax merge + normalise +
-                    # write to per-batch attn_row (single AIV task per gi).
+                    # Stage 5: online softmax accumulation and normalisation.
                     with pl.at(level=pl.Level.CORE_GROUP):
                         oi = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [0, 0])
                         mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [0, 0])
                         li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [0, 0])
                         for sb in pl.range(1, ctx_blocks):
-                            oi_tmp_valid = pl.slice(
-                                all_oi_tmp,
-                                [Q_HEAD_BATCH, head_dim],
-                                [sb * Q_HEAD_PAD, 0],
-                            )
-                            cur_mi = pl.slice(
-                                all_cur_mi, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0]
-                            )
-                            cur_li = pl.slice(
-                                all_cur_li, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0]
-                            )
+                            oi_tmp_valid = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [sb * Q_HEAD_PAD, 0])
+                            cur_mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
+                            cur_li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [sb * Q_HEAD_BATCH, 0])
                             mi_new = pl.maximum(mi, cur_mi)
                             alpha = pl.exp(pl.sub(mi, mi_new))
                             beta = pl.exp(pl.sub(cur_mi, mi_new))
                             li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
-                            oi = pl.add(
-                                pl.row_expand_mul(oi, alpha),
-                                pl.row_expand_mul(oi_tmp_valid, beta),
-                            )
+                            oi = pl.add(pl.row_expand_mul(oi, alpha),
+                                        pl.row_expand_mul(oi_tmp_valid, beta))
                             mi = mi_new
                         ctx = pl.row_expand_div(oi, li)
                         ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * head_dim])
                         ctx_flat_bf16 = pl.cast(ctx_flat, target_type=pl.BF16)
                         attn_row = pl.assemble(
-                            attn_row, ctx_flat_bf16, [0, q_base * head_dim]
+                            attn_row, ctx_flat_bf16, [0, q_base * head_dim],
                         )
 
                 attn_out = pl.assemble(attn_out, attn_row, [b, 0])
 
             return attn_out
 
-    return Qwen3Scope2
+    return Qwen3Scope2_OPT
 
 
 def build_tensor_specs(
@@ -499,8 +450,6 @@ if __name__ == "__main__":
                         help="Path to a directory with in/*.pt + out/*.pt for fixed-input comparison")
     args = parser.parse_args()
 
-    from datetime import datetime
-
     result = run(
         program=build_qwen3_scope2_program(),
         tensor_specs=build_tensor_specs(use_max_seq=args.max_seq),
@@ -509,10 +458,7 @@ if __name__ == "__main__":
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,
-            compile=dict(
-                dump_passes=True,
-                output_dir=f"build_output/Qwen3Scope2_opt_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            ),
+            compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,

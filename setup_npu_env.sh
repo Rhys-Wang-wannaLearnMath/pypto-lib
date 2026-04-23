@@ -29,7 +29,7 @@ NC='\033[0m' # No Color
 info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()   { echo -e "${RED}[ERROR]${NC} $*"; }
+err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 # ── Constants ──
 ENV_MARKER_BEGIN="# ── pypto-lib environment (inserted by setup_npu_env.sh) ──"
@@ -178,7 +178,12 @@ detect_cann_path() {
     return 1
 }
 
-CANN_PATH=$(detect_cann_path)
+CANN_PATH=$(detect_cann_path) || {
+    err "CANN detection failed. Is CANN / Ascend toolkit installed?"
+    err "If CANN is installed in a non-standard location, re-run with:"
+    err "  bash setup_npu_env.sh --cann /path/to/your/cann"
+    exit 1
+}
 ok "CANN path: $CANN_PATH"
 
 # Verify it looks valid (should contain bin/ or set_env.sh)

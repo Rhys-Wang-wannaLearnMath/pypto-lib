@@ -9,7 +9,7 @@
 
 | 项目 | 要求 |
 |---|---|
-| **操作系统** | Linux（Ascend NPU 服务器，通常 aarch64） |
+| **操作系统** | Linux **Ubuntu 22.04+**（GLIBC ≥ 2.34，ptoas 预编译二进制依赖）。Ubuntu 20.04 需先升级 glibc，见下方“2.1.1” |
 | **Python** | 3.10+ |
 | **C++ 编译器** | **g++-15**（必须，不能用 g++-11 等低版本替代）+ ninja-build |
 | **NPU 硬件** | Ascend 910B 或 Ascend 950 |
@@ -20,6 +20,31 @@
 ---
 
 ## 2. 安装步骤
+
+### 2.1.1 Ubuntu 20.04 升级 glibc（仅 20.04 需要）
+
+ptoas 预编译二进制需要 GLIBC ≥ 2.34，而 Ubuntu 20.04 自带 GLIBC 2.31。
+无需升级整个系统，只需添加 Ubuntu 22.04 (jammy) 的 apt 源并升级 libc6：
+
+```bash
+# 确认当前版本（预期输出 2.31）
+ldd --version | head -1
+
+# 添加 jammy 源（单独文件，不改原 sources.list，方便回退）
+# aarch64 使用 ports.ubuntu.com；x86_64 改为 archive.ubuntu.com/ubuntu
+sudo tee /etc/apt/sources.list.d/jammy.list << 'EOF'
+deb http://ports.ubuntu.com/ubuntu-ports/ jammy main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main restricted universe multiverse
+EOF
+
+sudo apt-get update
+sudo apt-get install -y libc6 -t jammy
+
+# 验证（预期输出 2.35）
+ldd --version | head -1
+```
+
+> **注意**：此操作只升级 glibc，不会升级整个系统到 22.04。
 
 ### 2.1 安装步骤（使用 uv）
 
@@ -44,6 +69,9 @@ sudo apt-get install -y ninja-build
 
 # 5. 安装 g++-15（必须是 15，pto-isa 头文件使用了 C++20 <format> 等特性，g++-11/12 不支持）
 #    Ubuntu 22.04 默认源没有 g++-15，需要添加 PPA：
+#    ⚠️ PPA 源在海外，下载可能极慢。如有代理可一次性指定（端口按实际调整）：
+#      sudo apt-get -o Acquire::http::Proxy="http://127.0.0.1:7890" -o Acquire::https::Proxy="http://127.0.0.1:7890" install -y g++-15
+sudo apt-get install -y software-properties-common   # 提供 add-apt-repository 命令
 sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
 sudo apt-get update
 sudo apt-get install -y g++-15
@@ -69,6 +97,7 @@ uv pip install /tmp/pypto
 uv pip install /tmp/pypto/runtime
 
 # 8. 安装 Python 依赖
+#    ⚠️ 下载慢时可在命令前加代理：HTTPS_PROXY=http://127.0.0.1:7890 uv pip install ...
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu   # golden 参考在 CPU 上计算
 uv pip install nanobind
 ```
@@ -526,6 +555,7 @@ python examples/models/qwen3/qwen3_32b_decode_mixed.py -p a2a3 -d 0 --runtime-pr
 | `RuntimeError: device not found` | NPU 不可见 | 检查 `npu-smi info`、CANN 安装、设备号 |
 | `ImportError: libascendcl.so` | CANN 路径未配置 | `export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.0` |
 | ptoas 架构不匹配 | x86_64 二进制在 aarch64 上运行 | 下载对应架构的 ptoas（见 2.2） |
+| ptoas 报 `GLIBC_2.32/2.34 not found` | 系统 glibc 版本过低（Ubuntu 20.04 = GLIBC 2.31） | 添加 jammy 源升级 glibc，见 2.1.1 节 |
 | `ModuleNotFoundError: pypto` | pypto 未安装 | 重新执行 `uv pip install /tmp/pypto && uv pip install /tmp/pypto/runtime` |
 | `ptoas: command not found` | 环境变量未设置 | `export PTOAS_ROOT=$HOME/ptoas-bin` |
 | `FileNotFoundError: pto-isa` | pto-isa 未克隆或路径错误 | `export PTO_ISA_ROOT=$HOME/pto-isa` |
@@ -535,5 +565,6 @@ python examples/models/qwen3/qwen3_32b_decode_mixed.py -p a2a3 -d 0 --runtime-pr
 | `Couldn't create temporary file /tmp/apt.conf.xxx` | `/tmp` 目录权限不正确（不是 `1777`） | `sudo chmod 1777 /tmp` |
 | `uv pip install /tmp/pypto` 卡在 `Building pypto ... Preparing packages` | pypto 含 ~490 个 C++ 文件，编译耗时长（4 核约 20-40 分钟），不是真的卡住 | 用 `ps aux \| grep cc1plus` 确认编译在进行；或先 `cmake --build` 手动编译以查看进度 |
 | `ModuleNotFoundError: golden` | 工作目录不对 | 确保从 pypto-lib 根目录运行 |
+| `add-apt-repository: command not found` | 缺少 `software-properties-common` 包 | `sudo apt-get install -y software-properties-common` |
 | `apt-get update` 下载极慢 | 网络问题，PPA 源在海外 | 配置 apt 代理：写入 `/etc/apt/apt.conf.d/99proxy`，内容为 `Acquire::http::Proxy "http://127.0.0.1:7890";` 和 `Acquire::https::Proxy "http://127.0.0.1:7890";`（端口根据实际代理调整） |
 | FAIL 且不匹配数很少 | BF16 精度累积误差 | 属于已知现象，可尝试放宽容差确认 |
