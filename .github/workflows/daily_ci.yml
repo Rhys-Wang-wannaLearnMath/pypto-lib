@@ -1,0 +1,292 @@
+name: Daily CI
+
+on:
+  schedule:
+    - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
+  workflow_dispatch:
+
+jobs:
+  model-tests-sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [a2a3sim, a5sim]
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
+      PTOAS_VERSION: v0.31
+      PTOAS_SHA256: cd9121b768f7383f5bda702c89507dd160f539c28bbdf57a0585be9473081d07
+      PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
+      PTO_ISA_COMMIT: 5779238f
+
+    steps:
+      - name: Checkout pypto-lib
+        uses: actions/checkout@v4
+
+      - name: Set up C++ compiler
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+          if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nanobind
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build and install pypto and simpler
+        run: |
+          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+          pip install /tmp/pypto
+          pip install /tmp/pypto/runtime
+
+      - name: Cache ptoas binary
+        id: cache-ptoas
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ptoas-bin
+          key: ptoas-x86_64-${{ env.PTOAS_VERSION }}-${{ env.PTOAS_SHA256 }}
+
+      - name: Install ptoas
+        if: steps.cache-ptoas.outputs.cache-hit != 'true'
+        run: |
+          curl --fail --location --retry 3 --retry-all-errors \
+            https://github.com/hw-native-sys/PTOAS/releases/download/${{ env.PTOAS_VERSION }}/ptoas-bin-x86_64.tar.gz \
+            -o /tmp/ptoas-bin-x86_64.tar.gz
+          echo "${{ env.PTOAS_SHA256 }}  /tmp/ptoas-bin-x86_64.tar.gz" | sha256sum -c -
+          mkdir -p $GITHUB_WORKSPACE/ptoas-bin
+          tar -xzf /tmp/ptoas-bin-x86_64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
+          chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
+          chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
+
+      - name: Clone pto-isa repository (pinned)
+        run: |
+          git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          cd $GITHUB_WORKSPACE/pto-isa
+          git checkout ${{ env.PTO_ISA_COMMIT }}
+
+      - name: Run model tests (${{ matrix.platform }})
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          PTO2_RING_DEP_POOL: 131072
+          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_HEAP: 4294967296
+        run: |
+          : > results.tsv
+          failed=""
+          for f in $(find examples/models -name '*.py' ! -name '*draft*' | sort); do
+            echo "::group::$f"
+            if ! timeout --kill-after=10s 300s python "$f" -p ${{ matrix.platform }}; then
+              failed="$failed $f"
+              echo "::error file=$f::FAIL"
+              printf '%s\tfail\n' "$f" >> results.tsv
+            else
+              printf '%s\tpass\n' "$f" >> results.tsv
+            fi
+            echo "::endgroup::"
+          done
+          # Extra dynamic-batch coverage for qwen3-14b-decode (default loop above
+          # already exercises batch=16; re-run with batch=1 and batch=20 to make
+          # sure a single compiled program serves arbitrary user_batch values).
+          QWEN3_14B="examples/models/qwen3/14b/qwen3_14b_decode.py"
+          for B in 1 20; do
+            case_name="${QWEN3_14B}[batch=${B}]"
+            echo "::group::${case_name}"
+            if ! timeout --kill-after=10s 600s python "${QWEN3_14B}" -p ${{ matrix.platform }} --batch "${B}"; then
+              failed="$failed ${case_name}"
+              echo "::error file=${QWEN3_14B}::FAIL (batch=${B})"
+              printf '%s\tfail\n' "${case_name}" >> results.tsv
+            else
+              printf '%s\tpass\n' "${case_name}" >> results.tsv
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "Failed cases:"
+            for f in $failed; do echo "  - $f"; done
+            exit 1
+          fi
+          echo "All model tests passed."
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.platform }}
+          path: results.tsv
+
+  model-tests-a2a3:
+    runs-on: [self-hosted, linux, arm64, npu]
+    timeout-minutes: 60
+    env:
+      ASCEND_HOME_PATH: /usr/local/Ascend/cann-8.5.0
+      PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
+      PTOAS_VERSION: v0.31
+      PTOAS_SHA256: ca184d071cef3af989ff3f98e7ce4c7262ba1e07405738b65e9900c43065ada5
+      PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
+      PTO_ISA_COMMIT: 5779238f
+    container:
+      image: localhost:5000/ci-device-py310:latest
+      options: >-
+        --privileged
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
+        -v /usr/local/Ascend:/usr/local/Ascend:ro
+        -v /dev:/dev
+        -e ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.0
+        -e DEVICE_ID
+
+    steps:
+      - name: Checkout pypto-lib
+        uses: actions/checkout@v4
+
+      - name: Check NPU
+        run: npu-smi info
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nanobind
+          pip install torch
+
+      - name: Add Ascend tools to PATH
+        run: echo "$ASCEND_HOME_PATH/bin" >> $GITHUB_PATH
+
+      - name: Build and install pypto and simpler
+        run: |
+          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+          pip install /tmp/pypto
+          pip install /tmp/pypto/runtime
+
+      - name: Cache ptoas binary
+        id: cache-ptoas
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ptoas-bin
+          key: ptoas-aarch64-${{ env.PTOAS_VERSION }}-${{ env.PTOAS_SHA256 }}
+
+      - name: Install ptoas
+        if: steps.cache-ptoas.outputs.cache-hit != 'true'
+        run: |
+          curl --fail --location --retry 3 --retry-all-errors \
+            https://github.com/hw-native-sys/PTOAS/releases/download/${{ env.PTOAS_VERSION }}/ptoas-bin-aarch64.tar.gz \
+            -o /tmp/ptoas-bin-aarch64.tar.gz
+          echo "${{ env.PTOAS_SHA256 }}  /tmp/ptoas-bin-aarch64.tar.gz" | sha256sum -c -
+          mkdir -p $GITHUB_WORKSPACE/ptoas-bin
+          tar -xzf /tmp/ptoas-bin-aarch64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
+          chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
+          chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
+
+      - name: Clone pto-isa repository (pinned)
+        run: |
+          git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          cd $GITHUB_WORKSPACE/pto-isa
+          git checkout ${{ env.PTO_ISA_COMMIT }}
+
+      - name: Run model tests (a2a3)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          PTO2_RING_DEP_POOL: 131072
+          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_HEAP: 4294967296
+        run: |
+          : > results.tsv
+          failed=""
+          for f in $(find examples/models -name '*.py' ! -name '*draft*' | sort); do
+            echo "::group::$f"
+            if ! timeout --kill-after=10s 300s python "$f" -p a2a3 -d $DEVICE_ID; then
+              failed="$failed $f"
+              echo "::error file=$f::FAIL"
+              printf '%s\tfail\n' "$f" >> results.tsv
+            else
+              printf '%s\tpass\n' "$f" >> results.tsv
+            fi
+            echo "::endgroup::"
+          done
+          # Extra dynamic-batch coverage for qwen3-14b-decode (default loop above
+          # already exercises batch=16; re-run with batch=1 and batch=20 to make
+          # sure a single compiled program serves arbitrary user_batch values).
+          QWEN3_14B="examples/models/qwen3/14b/qwen3_14b_decode.py"
+          for B in 1 20; do
+            case_name="${QWEN3_14B}[batch=${B}]"
+            echo "::group::${case_name}"
+            if ! timeout --kill-after=10s 600s python "${QWEN3_14B}" -p a2a3 -d $DEVICE_ID --batch "${B}"; then
+              failed="$failed ${case_name}"
+              echo "::error file=${QWEN3_14B}::FAIL (batch=${B})"
+              printf '%s\tfail\n' "${case_name}" >> results.tsv
+            else
+              printf '%s\tpass\n' "${case_name}" >> results.tsv
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "Failed cases:"
+            for f in $failed; do echo "  - $f"; done
+            exit 1
+          fi
+          echo "All model tests passed."
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-a2a3
+          path: results.tsv
+
+  summary:
+    name: Aggregate results summary
+    needs: [model-tests-sim, model-tests-a2a3]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+
+      - name: Build combined summary table
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import pathlib
+
+          PLATFORMS = ["a2a3", "a2a3sim", "a5sim"]
+          ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
+
+          results = {p: {} for p in PLATFORMS}
+          root = pathlib.Path("results")
+          for p in PLATFORMS:
+              tsv = root / f"results-{p}" / "results.tsv"
+              if not tsv.exists():
+                  continue
+              for line in tsv.read_text().splitlines():
+                  if not line.strip():
+                      continue
+                  case, status = line.split("\t", 1)
+                  results[p][case] = status
+
+          all_cases = sorted({c for p in PLATFORMS for c in results[p]})
+
+          print("## Daily CI Model Test Results")
+          print()
+          print("| Case | " + " | ".join(PLATFORMS) + " |")
+          print("| ---- | " + " | ".join(["---"] * len(PLATFORMS)) + " |")
+          for case in all_cases:
+              cells = [ICON.get(results[p].get(case, "missing"), "?") for p in PLATFORMS]
+              print(f"| `{case}` | " + " | ".join(cells) + " |")
+          EOF
