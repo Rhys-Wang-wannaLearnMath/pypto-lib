@@ -271,11 +271,53 @@ def run(
 
     # Runtime
     with _stage("runtime"):
-        ordered: list[Any] = [
-            tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
-            for s in specs
-        ]
-        execute_compiled(work_dir, ordered, **config.runtime)
+        # Detect L3 programs (HOST Orchestrator): ir.compile() returns a
+        # DistributedCompiledProgram.  These cannot use execute_compiled()
+        # (which expects kernel_config.py at the top level); instead call
+        # compiled() directly with all scalars passed as 0-dim tensors and
+        # args reordered to the function declaration order via _get_metadata().
+        _is_l3 = False
+        if runtime_dir is None:
+            try:
+                from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+                    DistributedCompiledProgram as _DC,
+                )
+                _is_l3 = isinstance(compiled, _DC)
+            except ImportError:
+                pass
+
+        if _is_l3:
+            from pypto.runtime import RunConfig as _PRC  # noqa: PLC0415
+
+            # Build name->value dict: tensors unchanged, scalars as 0-dim tensors.
+            _arg_map: dict[str, Any] = {s.name: tensors[s.name] for s in tensor_specs}
+            _arg_map.update(
+                {s.name: scalar_specs_eff[s.name].value for s in scalar_specs}
+            )
+            # Reorder to function declaration order from param_infos.
+            # SSA names have the form ``orig_name__ssa_vN``; strip the suffix.
+            _param_infos, _, _ = compiled._get_metadata()
+            _ordered_l3: list[Any] = [
+                _arg_map[p.name.split("__ssa_")[0]] for p in _param_infos
+            ]
+            _platform = config.runtime.get("platform", "a2a3")
+            # Forward every RunConfig field the caller supplied so L3 behaves
+            # consistently with the non-L3 path (which forwards via run_jit's
+            # whitelist).  Unknown keys fail fast inside RunConfig(**...).
+            import dataclasses as _dc  # noqa: PLC0415
+            _allowed = {f.name for f in _dc.fields(_PRC)}
+            _kwargs = {k: v for k, v in config.runtime.items() if k in _allowed}
+            _kwargs.setdefault("platform", _platform)
+            _kwargs.setdefault("device_id", 0)
+            _kwargs["backend_type"] = _backend_for_platform(_platform)
+            _run_cfg = _PRC(**_kwargs)
+            compiled(*_ordered_l3, config=_run_cfg)
+        else:
+            ordered: list[Any] = [
+                tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
+                for s in specs
+            ]
+            execute_compiled(work_dir, ordered, **config.runtime)
 
     if golden_fn is None and golden_data is None:
         total = time.time() - start

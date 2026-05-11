@@ -111,12 +111,33 @@ class LLMEngine:
             if not token_ids:
                 raise ValueError("Prompt tokenization produced no tokens.")
 
+        # L3 fast path currently supports batch_size=1 only.
+        is_l3 = callable(getattr(self._executor, "run_generate_l3", None)) and getattr(
+            self._executor, "_l3_mode", False
+        )
+        if is_l3 and len(prompts) > 1:
+            raise NotImplementedError(
+                "L3 generate fast path currently supports batch_size=1; "
+                f"got {len(prompts)} prompts."
+            )
+        # The L3 device-side loop cannot evaluate Python stop strings mid-flight,
+        # so reject them up-front rather than silently ignoring.
+        if is_l3 and any(generate_config.stop):
+            raise NotImplementedError(
+                "L3 generate fast path does not support generate_config.stop; "
+                "the device-side decode loop cannot break on host-side string matches."
+            )
+
         requests: list[RequestState] = []
         allocations = []
         try:
             for prompt, token_ids in zip(prompts, prompt_token_ids, strict=True):
                 request_id = f"req-{next(self._request_counter)}"
-                alloc = self._kv_cache_manager.allocate_for_prompt(model_id, request_id, len(token_ids))
+                # In L3 mode the entire decode loop runs on device without
+                # host-side ensure_one_more_slot calls, so pre-allocate KV
+                # capacity for the full prompt + max_new_tokens upfront.
+                alloc_len = len(token_ids) + generate_config.max_new_tokens if is_l3 else len(token_ids)
+                alloc = self._kv_cache_manager.allocate_for_prompt(model_id, request_id, alloc_len)
                 allocations.append(alloc)
                 requests.append(
                     RequestState(
@@ -152,9 +173,10 @@ class LLMEngine:
                     row_tokens,
                 )
 
-            prefill_result = self._executor.run_prefill(
-                runtime_model,
-                PrefillBatch(
+            # L3-wrapped generate: entire prefill + decode loop in one worker.run().
+            if is_l3:
+                run_generate_l3 = self._executor.run_generate_l3
+                prefill_batch = PrefillBatch(
                     request_ids=[request.request_id for request in requests],
                     token_ids=token_tensor,
                     input_embeddings=embeddings,
@@ -164,89 +186,128 @@ class LLMEngine:
                         device=runtime_model.runtime.device,
                     ),
                     kv_allocations=allocations,
-                ),
-            )
-
-            sampling_params = self._sampler.from_generate_config(generate_config)
-            current_tokens = []
-            for batch_idx in range(len(requests)):
-                current_tokens.append(
-                    self._sampler.sample(
-                        self._select_batch_row(prefill_result.logits, batch_idx),
-                        sampling_params,
-                    )
                 )
-            active_indices = list(range(len(requests)))
-            finish_reasons = ["length"] * len(requests)
-
-            for _ in range(generate_config.max_new_tokens):
-                next_active: list[int] = []
-                decode_tokens: list[int] = []
-                for request_idx in active_indices:
-                    request = requests[request_idx]
-                    current_token = current_tokens[request_idx]
-                    request.generated_token_ids.append(current_token)
-                    request.output_text = tokenizer.decode(request.generated_token_ids)
-
-                    if record.config.eos_token_id is not None and current_token == record.config.eos_token_id:
-                        finish_reasons[request_idx] = "eos"
-                        continue
-                    if any(stop and request.output_text.endswith(stop) for stop in generate_config.stop):
-                        finish_reasons[request_idx] = "stop"
-                        continue
-                    if len(request.generated_token_ids) >= generate_config.max_new_tokens:
-                        finish_reasons[request_idx] = "length"
-                        continue
-
-                    alloc = request.kv_allocation
-                    if alloc is None:
-                        raise RuntimeError("Request is missing KV allocation.")
-                    self._kv_cache_manager.ensure_one_more_slot(alloc)
-                    request.seq_len += 1
-                    next_active.append(request_idx)
-                    decode_tokens.append(current_token)
-
-                if not next_active:
-                    break
-
-                decode_token_tensor = torch.tensor(
-                    decode_tokens,
-                    dtype=torch.long,
-                    device=runtime_model.runtime.device,
-                )
-                decode_embeddings = self._executor.lookup_embeddings(runtime_model, decode_token_tensor)
-                active_allocations = []
-                for idx in next_active:
-                    alloc = requests[idx].kv_allocation
-                    if alloc is None:
-                        raise RuntimeError("Request is missing KV allocation.")
-                    active_allocations.append(alloc)
-                decode_result = self._executor.run_decode(
+                generated_ids, _ = run_generate_l3(
                     runtime_model,
-                    DecodeBatch(
-                        request_ids=[requests[idx].request_id for idx in next_active],
-                        token_ids=decode_token_tensor.unsqueeze(1),
-                        hidden_states=decode_embeddings,
+                    prefill_batch,
+                    max_new_tokens=generate_config.max_new_tokens,
+                    eos_token_id=record.config.eos_token_id,
+                )
+                request = requests[0]
+                request.generated_token_ids = list(generated_ids)
+                request.output_text = tokenizer.decode(generated_ids)
+                if generated_ids and record.config.eos_token_id is not None and generated_ids[-1] == record.config.eos_token_id:
+                    finish_reason = "eos"
+                else:
+                    # The L3 loop only exits on EOS or after producing
+                    # max_new_tokens; stop strings are rejected at entry above.
+                    finish_reason = "length"
+                return [
+                    GenerateResult(
+                        text=request.output_text,
+                        token_ids=list(request.generated_token_ids),
+                        finish_reason=finish_reason,
+                    )
+                ]
+
+            # Hold one shared L3 Worker across prefill + all decode steps.
+            # For the baseline executor, session() is a no-op.
+            with self._executor.session():
+                prefill_result = self._executor.run_prefill(
+                    runtime_model,
+                    PrefillBatch(
+                        request_ids=[request.request_id for request in requests],
+                        token_ids=token_tensor,
+                        input_embeddings=embeddings,
                         seq_lens=torch.tensor(
-                            [requests[idx].seq_len for idx in next_active],
+                            [len(token_ids) for token_ids in prompt_token_ids],
                             dtype=torch.int32,
                             device=runtime_model.runtime.device,
                         ),
-                        kv_allocations=active_allocations,
-                        block_table=self._kv_cache_manager.block_table_for_batch_padded(
-                            active_allocations
-                        ).to(runtime_model.runtime.device),
-                        slot_mapping=self._kv_cache_manager.slot_mapping_for_batch(active_allocations).to(
-                            runtime_model.runtime.device
-                        ),
+                        kv_allocations=allocations,
                     ),
                 )
-                for row_idx, request_idx in enumerate(next_active):
-                    current_tokens[request_idx] = self._sampler.sample(
-                        self._select_batch_row(decode_result.logits, row_idx),
-                        sampling_params,
+
+                sampling_params = self._sampler.from_generate_config(generate_config)
+                current_tokens = []
+                for batch_idx in range(len(requests)):
+                    current_tokens.append(
+                        self._sampler.sample(
+                            self._select_batch_row(prefill_result.logits, batch_idx),
+                            sampling_params,
+                        )
                     )
-                active_indices = next_active
+                active_indices = list(range(len(requests)))
+                finish_reasons = ["length"] * len(requests)
+
+                for _ in range(generate_config.max_new_tokens):
+                    next_active: list[int] = []
+                    decode_tokens: list[int] = []
+                    for request_idx in active_indices:
+                        request = requests[request_idx]
+                        current_token = current_tokens[request_idx]
+                        request.generated_token_ids.append(current_token)
+                        request.output_text = tokenizer.decode(request.generated_token_ids)
+
+                        if record.config.eos_token_id is not None and current_token == record.config.eos_token_id:
+                            finish_reasons[request_idx] = "eos"
+                            continue
+                        if any(stop and request.output_text.endswith(stop) for stop in generate_config.stop):
+                            finish_reasons[request_idx] = "stop"
+                            continue
+                        if len(request.generated_token_ids) >= generate_config.max_new_tokens:
+                            finish_reasons[request_idx] = "length"
+                            continue
+
+                        alloc = request.kv_allocation
+                        if alloc is None:
+                            raise RuntimeError("Request is missing KV allocation.")
+                        self._kv_cache_manager.ensure_one_more_slot(alloc)
+                        request.seq_len += 1
+                        next_active.append(request_idx)
+                        decode_tokens.append(current_token)
+
+                    if not next_active:
+                        break
+
+                    decode_token_tensor = torch.tensor(
+                        decode_tokens,
+                        dtype=torch.long,
+                        device=runtime_model.runtime.device,
+                    )
+                    decode_embeddings = self._executor.lookup_embeddings(runtime_model, decode_token_tensor)
+                    active_allocations = []
+                    for idx in next_active:
+                        alloc = requests[idx].kv_allocation
+                        if alloc is None:
+                            raise RuntimeError("Request is missing KV allocation.")
+                        active_allocations.append(alloc)
+                    decode_result = self._executor.run_decode(
+                        runtime_model,
+                        DecodeBatch(
+                            request_ids=[requests[idx].request_id for idx in next_active],
+                            token_ids=decode_token_tensor.unsqueeze(1),
+                            hidden_states=decode_embeddings,
+                            seq_lens=torch.tensor(
+                                [requests[idx].seq_len for idx in next_active],
+                                dtype=torch.int32,
+                                device=runtime_model.runtime.device,
+                            ),
+                            kv_allocations=active_allocations,
+                            block_table=self._kv_cache_manager.block_table_for_batch(active_allocations).to(
+                                runtime_model.runtime.device
+                            ),
+                            slot_mapping=self._kv_cache_manager.slot_mapping_for_batch(active_allocations).to(
+                                runtime_model.runtime.device
+                            ),
+                        ),
+                    )
+                    for row_idx, request_idx in enumerate(next_active):
+                        current_tokens[request_idx] = self._sampler.sample(
+                            self._select_batch_row(decode_result.logits, row_idx),
+                            sampling_params,
+                        )
+                    active_indices = next_active
         finally:
             for alloc in allocations:
                 self._kv_cache_manager.free(alloc)
@@ -290,63 +351,67 @@ class LLMEngine:
         try:
             token_tensor = torch.tensor(prompt_token_ids, dtype=torch.long, device=runtime_model.runtime.device)
             embeddings = self._executor.lookup_embeddings(runtime_model, token_tensor).unsqueeze(0)
-            prefill_result = self._executor.run_prefill(
-                runtime_model,
-                PrefillBatch(
-                    request_ids=[request.request_id],
-                    token_ids=token_tensor.unsqueeze(0),
-                    input_embeddings=embeddings,
-                    seq_lens=torch.tensor(
-                        [len(prompt_token_ids)],
-                        dtype=torch.int32,
-                        device=runtime_model.runtime.device,
-                    ),
-                    kv_allocations=[alloc],
-                ),
-            )
 
-            logits = self._select_batch_row(prefill_result.logits, 0)
-            generated: list[int] = []
-            emitted_text = ""
-            sampling_params = self._sampler.from_generate_config(config)
-            current_token = self._sampler.sample(logits, sampling_params)
-
-            for _ in range(config.max_new_tokens):
-                generated.append(current_token)
-                text = tokenizer.decode(generated)
-                delta = text[len(emitted_text) :]
-                emitted_text = text
-                if delta:
-                    yield delta
-                if self._should_stop(record, config, generated, emitted_text, current_token):
-                    break
-
-                self._kv_cache_manager.ensure_one_more_slot(alloc)
-                request.seq_len += 1
-                decode_token = torch.tensor([current_token], dtype=torch.long, device=runtime_model.runtime.device)
-                decode_embeddings = self._executor.lookup_embeddings(runtime_model, decode_token)
-                decode_result = self._executor.run_decode(
+            # Hold one shared L3 Worker across prefill + all decode steps.
+            # For the baseline executor, session() is a no-op.
+            with self._executor.session():
+                prefill_result = self._executor.run_prefill(
                     runtime_model,
-                    DecodeBatch(
+                    PrefillBatch(
                         request_ids=[request.request_id],
-                        token_ids=decode_token.unsqueeze(0),
-                        hidden_states=decode_embeddings,
+                        token_ids=token_tensor.unsqueeze(0),
+                        input_embeddings=embeddings,
                         seq_lens=torch.tensor(
-                            [request.seq_len],
+                            [len(prompt_token_ids)],
                             dtype=torch.int32,
                             device=runtime_model.runtime.device,
                         ),
                         kv_allocations=[alloc],
-                        block_table=self._kv_cache_manager.block_table_for_batch_padded([alloc]).to(
-                            runtime_model.runtime.device
-                        ),
-                        slot_mapping=self._kv_cache_manager.slot_mapping_for_batch([alloc]).to(
-                            runtime_model.runtime.device
-                        ),
                     ),
                 )
-                logits = self._select_batch_row(decode_result.logits, 0)
+
+                logits = self._select_batch_row(prefill_result.logits, 0)
+                generated: list[int] = []
+                emitted_text = ""
+                sampling_params = self._sampler.from_generate_config(config)
                 current_token = self._sampler.sample(logits, sampling_params)
+
+                for _ in range(config.max_new_tokens):
+                    generated.append(current_token)
+                    text = tokenizer.decode(generated)
+                    delta = text[len(emitted_text) :]
+                    emitted_text = text
+                    if delta:
+                        yield delta
+                    if self._should_stop(record, config, generated, emitted_text, current_token):
+                        break
+
+                    self._kv_cache_manager.ensure_one_more_slot(alloc)
+                    request.seq_len += 1
+                    decode_token = torch.tensor([current_token], dtype=torch.long, device=runtime_model.runtime.device)
+                    decode_embeddings = self._executor.lookup_embeddings(runtime_model, decode_token)
+                    decode_result = self._executor.run_decode(
+                        runtime_model,
+                        DecodeBatch(
+                            request_ids=[request.request_id],
+                            token_ids=decode_token.unsqueeze(0),
+                            hidden_states=decode_embeddings,
+                            seq_lens=torch.tensor(
+                                [request.seq_len],
+                                dtype=torch.int32,
+                                device=runtime_model.runtime.device,
+                            ),
+                            kv_allocations=[alloc],
+                            block_table=self._kv_cache_manager.block_table_for_batch([alloc]).to(
+                                runtime_model.runtime.device
+                            ),
+                            slot_mapping=self._kv_cache_manager.slot_mapping_for_batch([alloc]).to(
+                                runtime_model.runtime.device
+                            ),
+                        ),
+                    )
+                    logits = self._select_batch_row(decode_result.logits, 0)
+                    current_token = self._sampler.sample(logits, sampling_params)
         finally:
             self._kv_cache_manager.free(alloc)
 
