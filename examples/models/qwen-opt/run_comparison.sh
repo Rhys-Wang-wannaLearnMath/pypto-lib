@@ -35,10 +35,10 @@ fi
 # ── Define original → optimized pairs ──
 # Format: "original_path|optimized_path"
 PAIRS=(
-    "examples/models/qwen3/qwen3_32b_decode_scope1.py|examples/models/qwen-opt/qwen3_32b_decode_scope1_opt.py"
-    "examples/models/qwen3/qwen3_32b_decode_scope1_tile.py|examples/models/qwen-opt/qwen3_32b_decode_scope1_tile_opt.py"
-    "examples/models/qwen3/qwen3_32b_decode_scope2.py|examples/models/qwen-opt/qwen3_32b_decode_scope2_opt.py"
-    "examples/models/qwen3/qwen3_32b_decode_scope3.py|examples/models/qwen-opt/qwen3_32b_decode_scope3_opt.py"
+    "examples/models/qwen3/32b/qwen3_32b_decode_scope1.py|examples/models/qwen-opt/qwen3_32b_decode_scope1-opt.py"
+    "examples/models/qwen3/32b/qwen3_32b_decode_scope2.py|examples/models/qwen-opt/qwen3_32b_decode_scope2-opt.py"
+    "examples/models/qwen3/32b/qwen3_32b_decode_scope3.py|examples/models/qwen-opt/qwen3_32b_decode_scope3-opt.py"
+    "examples/models/qwen3/32b/qwen3_32b_decode.py|examples/models/qwen-opt/qwen3_32b_decode-opt.py"
 )
 
 PASS_COUNT=0

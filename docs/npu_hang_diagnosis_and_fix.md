@@ -114,8 +114,8 @@ if not platform.endswith("sim"):
                 print(f"[WARN] block_dim={block_dim} exceeds AICore count={hw_max}; "
                       f"clamping to {new_bd} (divisible by {sched_threads}).")
                 block_dim = new_bd
-    except Exception:
-        pass  # best-effort; fall through to user-specified block_dim
+    except Exception as _e:
+        print(f"[WARN] block_dim auto-clamp failed: {_e}", flush=True)
 ```
 
 ### 3.3 校正逻辑
@@ -131,7 +131,19 @@ if not platform.endswith("sim"):
 - `new_bd = (20 // 3) * 3 = 18`
 - 输出：`block_dim=18`
 
-### 3.4 验证结果
+### 3.4 前置条件：`LD_LIBRARY_PATH` 必须包含 CANN lib64
+
+以上代码通过 `ctypes.CDLL("libruntime.so")` 加载 CANN 运行时库。如果 `LD_LIBRARY_PATH` 中缺少 `$ASCEND_HOME_PATH/lib64`，则加载失败，校正逻辑不会生效，导致间歇性挂起。
+
+确保 `~/.bashrc` 中包含：
+
+```bash
+export LD_LIBRARY_PATH=$HOME/miniforge3/lib:$ASCEND_HOME_PATH/lib64:$LD_LIBRARY_PATH
+```
+
+> **说明**：早期版本的 patch 使用 `except Exception: pass` 静默吞掉异常，导致加载失败时无任何提示。当前版本已改为打印诊断信息（`[WARN] block_dim auto-clamp failed: ...`）。
+
+### 3.5 验证结果
 
 | 测试 | 修复前 | 修复后 |
 |------|--------|--------|

@@ -9,11 +9,12 @@
 
 | 项目 | 要求 |
 |---|---|
-| **操作系统** | Linux **Ubuntu 22.04+**（GLIBC ≥ 2.34，ptoas 预编译二进制依赖）。Ubuntu 20.04 需先升级 glibc，见下方“2.1.1” |
+| **操作系统** | Linux：**Ubuntu 22.04+** 或 **Huawei Cloud EulerOS (HCE) 2.0** 或 **CentOS/openEuler**（GLIBC ≥ 2.34，ptoas 预编译二进制依赖）。Ubuntu 20.04 需先升级 glibc，见下方"2.1.1" |
 | **Python** | 3.10+ |
 | **C++ 编译器** | **g++-15**（必须，不能用 g++-11 等低版本替代）+ ninja-build |
 | **NPU 硬件** | Ascend 910B 或 Ascend 950 |
-| **CANN 工具包** | Ascend CANN 8.5.0+（`npu-smi info` 可用） |
+| **CANN 工具包** | Ascend CANN 8.5.0+（`npu-smi info` 可用）。**CANN 8.0.x 不兼容**，pto-isa 头文件使用了 8.5.0+ ccec 才支持的语言扩展 |
+| **NPU 驱动** | 需与 CANN 版本匹配（如 CANN 8.5.0 需驱动 25.5.0+） |
 | **架构** | aarch64（NPU 服务器）或 x86_64 |
 | **`/tmp` 目录权限** | 必须为 `1777`（`drwxrwxrwt`），否则 apt/pip 等工具无法创建临时文件 |
 
@@ -64,10 +65,14 @@ source ~/.bashrc  # 或 source ~/.zshrc
 sudo chmod 1777 /tmp
 
 # 4. 安装系统依赖
-sudo apt-get update
-sudo apt-get install -y ninja-build
+#    Ubuntu:
+sudo apt-get update && sudo apt-get install -y ninja-build
+#    EulerOS / CentOS / openEuler:
+#    sudo dnf install -y ninja-build
 
 # 5. 安装 g++-15（必须是 15，pto-isa 头文件使用了 C++20 <format> 等特性，g++-11/12 不支持）
+#
+#    ────── 方案 A：Ubuntu（通过 PPA）──────
 #    Ubuntu 22.04 默认源没有 g++-15，需要添加 PPA：
 #    ⚠️ PPA 源在海外，下载可能极慢。如有代理可一次性指定（端口按实际调整）：
 #      sudo apt-get -o Acquire::http::Proxy="http://127.0.0.1:7890" -o Acquire::https::Proxy="http://127.0.0.1:7890" install -y g++-15
@@ -78,6 +83,16 @@ sudo apt-get install -y g++-15
 #    如果安装后 g++-15 命令不可用，可能需要手动创建符号链接：
 #    sudo ln -sf /usr/bin/x86_64-linux-gnu-g++-15 /usr/bin/g++-15       # x86_64
 #    sudo ln -sf /usr/bin/aarch64-linux-gnu-g++-15 /usr/bin/g++-15      # aarch64
+#
+#    ────── 方案 B：EulerOS / CentOS / openEuler（通过 Miniforge3 + conda）──────
+#    这些发行版的系统源通常没有 g++-15，可通过 Miniforge3 安装独立工具链：
+#      wget https://mirrors.tuna.tsinghua.edu.cn/github-release/conda-forge/miniforge/Miniforge3-Linux-aarch64.sh
+#      bash Miniforge3-Linux-aarch64.sh -b -p $HOME/miniforge3
+#      $HOME/miniforge3/bin/conda create -n gcc15 -y gxx_linux-aarch64=15.2.0
+#      ln -sf $HOME/miniforge3/envs/gcc15/bin/aarch64-linux-gnu-g++ $HOME/.local/bin/g++-15
+#    ⚠️ 同时需要将 miniforge3 的 libstdc++ 加入 LD_LIBRARY_PATH（见第 3 节环境变量），
+#    因为 EulerOS 系统自带的 libstdc++ 可能缺少 GLIBCXX_3.4.29（ptoas 运行时依赖）。
+#
 g++-15 --version   # 确认输出 15.x
 
 # 6. 创建 uv 虚拟环境并激活
@@ -102,17 +117,17 @@ uv pip install torch --index-url https://download.pytorch.org/whl/cpu   # golden
 uv pip install nanobind
 ```
 
-### 2.2 安装 ptoas（PTO 汇编器，v0.25）
+### 2.2 安装 ptoas（PTO 汇编器，v0.31）
 
 根据 NPU 服务器架构选择对应版本：
 
 ```bash
 # aarch64（真实 NPU 服务器，最常见）
-curl -L https://github.com/hw-native-sys/PTOAS/releases/download/v0.25/ptoas-bin-aarch64.tar.gz \
+curl -L https://github.com/hw-native-sys/PTOAS/releases/download/v0.31/ptoas-bin-aarch64.tar.gz \
   -o /tmp/ptoas.tar.gz
 
 # x86_64（如服务器为 x86 架构）
-curl -L https://github.com/hw-native-sys/PTOAS/releases/download/v0.25/ptoas-bin-x86_64.tar.gz \
+curl -L https://github.com/hw-native-sys/PTOAS/releases/download/v0.31/ptoas-bin-x86_64.tar.gz \
   -o /tmp/ptoas.tar.gz
 
 # 解压并设置权限
@@ -126,11 +141,14 @@ chmod +x $HOME/ptoas-bin/ptoas $HOME/ptoas-bin/bin/ptoas
 
 ```bash
 git clone https://github.com/hw-native-sys/pto-isa.git $HOME/pto-isa
-cd $HOME/pto-isa && git checkout ed0b4643 && cd -
+cd $HOME/pto-isa && git checkout 5779238f && cd -
 ```
 
-> CI 当前锁定 pto-isa 提交 `ed0b4643`，ptoas 版本 `v0.25`。
+> CI 当前锁定 pto-isa 提交 `5779238f`，ptoas 版本 `v0.31`。
 > 使用其他版本可能导致不兼容。
+>
+> **网络问题**：如果 `git clone` 报 `HTTP/2 stream 1 was not closed cleanly`（常见于代理环境），
+> 可尝试强制 HTTP/1.1：`git config --global http.version HTTP/1.1`
 
 ### 2.4 真实设备额外步骤
 
@@ -195,7 +213,58 @@ export PATH=$ASCEND_HOME_PATH/bin:$PATH
 source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
 ```
 
-#### 2.4.3 NPU 版 PyTorch（可选）
+#### 2.4.3 安装 / 升级 CANN 和驱动
+
+如果系统未安装 CANN 或版本低于 8.5.0（**CANN 8.0.x 不兼容**），需要安装或升级。
+
+**检查当前版本**：
+
+```bash
+cat /usr/local/Ascend/ascend-toolkit/latest/compiler/version.info 2>/dev/null | head -2
+# 如输出 Version=8.0.1 则需要升级
+```
+
+**方案 A：yum 在线安装（EulerOS / CentOS / openEuler，推荐）**
+
+```bash
+# 1. 配置 Ascend yum 源
+sudo curl https://repo.oepkgs.net/ascend/cann/ascend.repo -o /etc/yum.repos.d/ascend.repo
+sudo yum makecache
+
+# 2. 卸载旧版 CANN（如有）
+#    sudo bash /usr/local/Ascend/ascend-toolkit/<旧版本号>/cann_uninstall.sh
+
+# 3. 安装 CANN toolkit + 910B 算子包
+sudo yum install -y Ascend-cann-toolkit-8.5.0
+sudo yum install -y Ascend-cann-910b-ops-8.5.0
+#    ⚠️ 如果安装脚本报错 "scriptlet failed"，检查 root 的 ~/.bashrc 是否引用了
+#    已删除的 set_env.sh，注释该行后重试。
+
+# 4. 升级 NPU 驱动（CANN 8.5.0 需要驱动 25.5.0+）
+sudo yum install -y Ascend910B-driver-25.5.0
+#    ⚠️ 驱动升级后必须重启服务器使新内核模块生效：
+#    sudo reboot
+```
+
+**方案 B：.run 离线安装（Ubuntu 或无 yum 源的环境）**
+
+从 [Ascend 社区](https://www.hiascend.com/developer/download/community/result?module=cann) 下载：
+- `Ascend-cann-toolkit_8.5.0_linux-aarch64.run`（开发套件）
+- `Ascend-cann-910b-ops_8.5.0_linux-aarch64.run`（910B 算子包，A2 系列）
+
+```bash
+sudo chmod +x Ascend-cann-toolkit_8.5.0_linux-aarch64.run
+sudo ./Ascend-cann-toolkit_8.5.0_linux-aarch64.run --install
+
+sudo chmod +x Ascend-cann-910b-ops_8.5.0_linux-aarch64.run
+sudo ./Ascend-cann-910b-ops_8.5.0_linux-aarch64.run --install
+```
+
+> **驱动版本兼容性**：CANN 8.5.0 的 HAL 层使用了新的驱动 API（如 `halMemCtl`、
+> `halGetAicpuNum`），旧驱动（如 24.1.0.3）会报 `halMemCtl failed with rc=3`
+> 并导致 `run_runtime failed with code 3`。必须升级驱动到 25.5.0+ 并重启。
+
+#### 2.4.4 NPU 版 PyTorch（可选）
 
 Golden 参考在 CPU 上计算，通常不需要 NPU 版 PyTorch。
 如有需要：
@@ -260,6 +329,12 @@ export PTOAS_ROOT=$HOME/ptoas-bin
 export PTO_ISA_ROOT=$HOME/pto-isa
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest   # ← 替换为实际路径
 export PATH=$ASCEND_HOME_PATH/bin:$PTOAS_ROOT:$PATH
+# EulerOS/CentOS：如果通过 Miniforge3 安装了 g++-15，需要加入其 libstdc++
+# （解决 ptoas 报 GLIBCXX_3.4.29 not found 的问题）
+# 同时必须加入 CANN lib64，否则 block_dim 自动校正可能失效导致 binned 设备挂起
+# export LD_LIBRARY_PATH=$HOME/miniforge3/lib:$ASCEND_HOME_PATH/lib64:$LD_LIBRARY_PATH
+# 如果 golden 模块导入失败，还需加入 pypto-lib 根目录：
+# export PYTHONPATH=/path/to/pypto-lib:$PYTHONPATH
 # ── end pypto-lib environment ──
 ENVBLOCK
 
@@ -556,15 +631,25 @@ python examples/models/qwen3/qwen3_32b_decode_mixed.py -p a2a3 -d 0 --runtime-pr
 | `ImportError: libascendcl.so` | CANN 路径未配置 | `export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.0` |
 | ptoas 架构不匹配 | x86_64 二进制在 aarch64 上运行 | 下载对应架构的 ptoas（见 2.2） |
 | ptoas 报 `GLIBC_2.32/2.34 not found` | 系统 glibc 版本过低（Ubuntu 20.04 = GLIBC 2.31） | 添加 jammy 源升级 glibc，见 2.1.1 节 |
+| ptoas 报 `GLIBCXX_3.4.29 not found` | 系统 libstdc++ 版本过低（EulerOS / CentOS 常见） | 通过 Miniforge3 安装 gcc15，将 `$HOME/miniforge3/lib` 加入 `LD_LIBRARY_PATH`（见 2.1 步骤 5 方案 B） |
 | `ModuleNotFoundError: pypto` | pypto 未安装 | 重新执行 `uv pip install /tmp/pypto && uv pip install /tmp/pypto/runtime` |
 | `ptoas: command not found` | 环境变量未设置 | `export PTOAS_ROOT=$HOME/ptoas-bin` |
 | `FileNotFoundError: pto-isa` | pto-isa 未克隆或路径错误 | `export PTO_ISA_ROOT=$HOME/pto-isa` |
-| `FileNotFoundError: 'g++-15'` | g++-15 未安装 | 通过 PPA 安装，见 2.1 节步骤 5 |
+| `FileNotFoundError: 'g++-15'` | g++-15 未安装 | Ubuntu：通过 PPA 安装；EulerOS：通过 Miniforge3 安装（见 2.1 节步骤 5） |
 | `fatal error: format: No such file or directory` (`#include <format>`) | 使用了 g++-11 等低版本编译器（不支持 C++20 `<format>`） | 必须安装真正的 g++-15，不能用 g++-11 符号链接替代 |
 | `g++-15` 安装后 `command not found` | 包只安装了带架构前缀的二进制，缺少 `g++-15` 链接 | `sudo ln -sf /usr/bin/aarch64-linux-gnu-g++-15 /usr/bin/g++-15`（x86 则替换为 `x86_64-linux-gnu-g++-15`） |
+| ccec 编译报 `unknown type name '__biasbuf__'` 等 | CANN 版本过低（8.0.x），pto-isa 头文件使用了 8.5.0+ ccec 才支持的语言扩展 | 升级 CANN 至 8.5.0+（见 2.4.3 节） |
+| `FileNotFoundError: ccec compiler not found` | ccec 不在 `$ASCEND_HOME_PATH/bin/` 下 | 检查 CANN 安装是否完整；旧版 CANN 可能将 ccec 放在 `<version>/aarch64-linux/ccec_compiler/bin/`，需创建符号链接或升级 CANN |
+| `halMemCtl failed with rc=3` / `run_runtime failed with code 3` | NPU 驱动版本与 CANN 不匹配（如驱动 24.1.0.3 + CANN 8.5.0） | 升级驱动至 25.5.0+（见 2.4.3 节），升级后需重启服务器 |
+| `dcmi module initialize failed` / `npu-smi` 报错 | 驱动升级后未重启，旧内核模块仍在内存中 | `sudo reboot` |
+| 运行时在 `rtStreamSynchronize stream_aicpu_` 永久挂起 | 设备为非满配（binned）型号（如 910B3/B4 Bin6 仅 20 AICore），默认 `block_dim=24` 超过硬件上限导致 TSCH 死锁 | 在 `device_runner.py` 的 `execute_on_device()` 中添加 `block_dim` 自动校正，详见 `docs/npu_hang_diagnosis_and_fix.md` |
+| block_dim 自动校正间歇性失效，运行不稳定 | `LD_LIBRARY_PATH` 缺少 `$ASCEND_HOME_PATH/lib64`，导致 `ctypes.CDLL("libruntime.so")` 加载失败 | 确保 `~/.bashrc` 中 `LD_LIBRARY_PATH` 包含 `$ASCEND_HOME_PATH/lib64`（见 3.2 节手动配置示例） |
+| `Pre-built runtime binaries not found` (simpler) | CANN 升级后预编译二进制需重新构建 | `uv pip install /tmp/pypto/runtime`（重新编译安装 simpler） |
+| `git clone` 报 `HTTP/2 stream 1 was not closed cleanly` | 代理环境下 HTTP/2 多路复用不兼容 | `git config --global http.version HTTP/1.1` |
 | `Couldn't create temporary file /tmp/apt.conf.xxx` | `/tmp` 目录权限不正确（不是 `1777`） | `sudo chmod 1777 /tmp` |
 | `uv pip install /tmp/pypto` 卡在 `Building pypto ... Preparing packages` | pypto 含 ~490 个 C++ 文件，编译耗时长（4 核约 20-40 分钟），不是真的卡住 | 用 `ps aux \| grep cc1plus` 确认编译在进行；或先 `cmake --build` 手动编译以查看进度 |
-| `ModuleNotFoundError: golden` | 工作目录不对 | 确保从 pypto-lib 根目录运行 |
+| `ModuleNotFoundError: golden` | 工作目录不对或 PYTHONPATH 未包含 pypto-lib 根目录 | 确保从 pypto-lib 根目录运行，或 `export PYTHONPATH=/path/to/pypto-lib:$PYTHONPATH` |
 | `add-apt-repository: command not found` | 缺少 `software-properties-common` 包 | `sudo apt-get install -y software-properties-common` |
 | `apt-get update` 下载极慢 | 网络问题，PPA 源在海外 | 配置 apt 代理：写入 `/etc/apt/apt.conf.d/99proxy`，内容为 `Acquire::http::Proxy "http://127.0.0.1:7890";` 和 `Acquire::https::Proxy "http://127.0.0.1:7890";`（端口根据实际代理调整） |
+| yum 安装 CANN 时 RPM scriptlet failed | root 的 `~/.bashrc` 引用了已删除的 `set_env.sh` | `sudo sed -i 's|^source .*/set_env.sh|# &|' /root/.bashrc` 注释该行后重试 |
 | FAIL 且不匹配数很少 | BF16 精度累积误差 | 属于已知现象，可尝试放宽容差确认 |
