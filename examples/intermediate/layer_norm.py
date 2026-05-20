@@ -103,29 +103,27 @@ def golden_layer_norm(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--runtime-profiling", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run(
         program=build_layer_norm_program(),
-        tensor_specs=build_tensor_specs(),
+        specs=build_tensor_specs(),
         golden_fn=golden_layer_norm,
-        config=RunConfig(
-            rtol=1e-2,
-            atol=1e-2,
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                runtime_profiling=args.runtime_profiling,
-            ),
+        compile_cfg=dict(dump_passes=True),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        rtol=1e-2,
+        atol=1e-2,
     )
     if not result.passed:
         if result.error:

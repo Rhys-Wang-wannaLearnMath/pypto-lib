@@ -1,0 +1,452 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""DeepSeek-V4 MoE end-to-end path (decode, EP single-card).
+
+Connects ``hc_pre`` + router + dispatch + expert + combine + ``hc_post`` inside
+one ``@pl.jit`` orchestration.
+The local EP=1 dispatch contract is:
+
+    for t, k:
+        e = indices[t, k]
+        slot = recv_expert_count[e]
+        recv_x[e, slot, :] = x_norm[t, :]
+        recv_weights[e, slot] = weights[t, k]
+        recv_token[e, slot] = t
+        recv_expert_count[e] += 1
+
+``moe_combine`` multiplies ``recv_weights`` into the routed expert activation
+during the FP32 weighted reduction.
+The current integration deliberately lets the expert process all ``RECV_MAX``
+rows per expert, with non-routed tail rows initialized to zero. The actual
+``recv_expert_count`` is still used by combine, so only valid packed rows are
+scattered back to tokens.
+"""
+
+
+import pypto.language as pl
+
+from config import (
+    FLASH as M,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    INT8_AMAX_EPS,
+    INT8_SCALE_MAX,
+    EP_WORLD_SIZE,
+    RECV_MAX,
+)
+from hc_pre import hc_pre
+from hc_post import hc_post
+from moe_router import moe_router
+from moe_dispatch import moe_dispatch
+from moe_expert import moe_expert
+from moe_combine import moe_combine
+
+
+# --- Shared shape constants. Must agree with the imported inlines. ---
+B = DECODE_BATCH
+S = DECODE_SEQ
+T = B * S
+D = M.hidden_size
+
+# hc_pre (ffn) weights
+HC_MULT = M.hc_mult
+MIX_HC = M.mix_hc
+HC_DIM = M.hc_dim
+
+# Router
+N_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE   # single-card simplification: router routes over local shard only
+TOPK = M.num_experts_per_tok
+VOCAB = M.vocab_size
+
+# Expert (must match moe_expert.py)
+MOE_INTER = M.moe_intermediate_size
+N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
+
+
+@pl.jit.inline
+def moe(
+    # ---- router (hc_pre + ffn_norm + gate) inputs ----
+    x_hc:           pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
+    hc_ffn_fn:      pl.Tensor[[MIX_HC, HC_DIM],              pl.FP32],
+    hc_ffn_scale:   pl.Tensor[[3],                           pl.FP32],
+    hc_ffn_base:    pl.Tensor[[MIX_HC],                      pl.FP32],
+    norm_w:         pl.Tensor[[D],                           pl.FP32],
+    gate_w:         pl.Tensor[[N_EXPERTS, D],                pl.FP32],
+    gate_bias:      pl.Tensor[[N_EXPERTS],                   pl.FP32],
+    tid2eid:        pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
+    input_ids:      pl.Tensor[[B, S],                        pl.INT64],
+    # ---- expert weights ----
+    expert_w1:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
+    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER],    pl.FP32],
+    expert_w3:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
+    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER],    pl.FP32],
+    expert_w2:      pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER],  pl.INT8],
+    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D],            pl.FP32],
+    shared_w1:      pl.Tensor[[MOE_INTER, D],                pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER],                  pl.FP32],
+    shared_w3:      pl.Tensor[[MOE_INTER, D],                pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER],                  pl.FP32],
+    shared_w2:      pl.Tensor[[D, MOE_INTER],                pl.INT8],
+    shared_w2_scale: pl.Tensor[[D],                          pl.FP32],
+    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1],  pl.INT32],
+    # ---- output ----
+    x_next:         pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
+    # ---- scalars ----
+    layer_id:       pl.Scalar[pl.INT32],
+):
+    # Stage 1: hc_pre(ffn) -> x_mixed, post_ffn, comb_ffn
+    x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    post_ffn = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
+    comb_ffn = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
+    hc_pre(
+        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        x_mixed, post_ffn, comb_ffn,
+    )
+
+    # Stage 2: router kernel -> x_norm and compact route tables.
+    x_norm = pl.create_tensor([T, D], dtype=pl.BF16)
+    indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
+    weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
+    moe_router(
+        x_mixed,
+        norm_w, gate_w, gate_bias,
+        layer_id,
+        tid2eid, input_ids,
+        x_norm, indices, weights,
+    )
+
+    # Stage 3: packed dispatch. `recv_x` is INT8 (per-token quantized once
+    # inside dispatch), `recv_scale_dq` carries the per-token dequant scale.
+    recv_x = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.INT8)
+    recv_scale_dq = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
+    recv_weights = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
+    recv_token = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
+    recv_expert_count = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
+    moe_dispatch(
+        x_norm, indices, weights,
+        recv_x, recv_scale_dq, recv_weights, recv_token, recv_expert_count,
+    )
+
+    # Stage 4: routed local experts + shared expert. Use a full count for the
+    # expert loop so `moe_expert` does not need to derive its dynamic tile count
+    # from an internal dispatch-produced tensor. Tail rows are zero weighted.
+    recv_y = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.BF16)
+    sh = pl.create_tensor([T, D], dtype=pl.BF16)
+    moe_expert(
+        recv_x, recv_scale_dq, recv_expert_count_full, x_norm,
+        expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
+        expert_w2, expert_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        recv_y, sh,
+    )
+
+    # Stage 5: combine routed and shared expert outputs.
+    # ``ffn_out`` is [B, S, D] so ``hc_post`` consumes it directly with no
+    # post-write reshape — avoids the codegen alias bug where reshape on
+    # the SSA-rebound output would resolve to ``routed_y_buf__rv_v2`` and
+    # trigger a runtime ``valid_reshape`` numel mismatch.
+    ffn_out = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    moe_combine(recv_y, recv_token, recv_weights, recv_expert_count, sh, ffn_out)
+
+    # Stage 6: hc_post(ffn) merges the FFN output back into the HC stack.
+    x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+    return x_next
+
+
+@pl.jit
+def moe_test(
+    x_hc:           pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
+    hc_ffn_fn:      pl.Tensor[[MIX_HC, HC_DIM],              pl.FP32],
+    hc_ffn_scale:   pl.Tensor[[3],                           pl.FP32],
+    hc_ffn_base:    pl.Tensor[[MIX_HC],                      pl.FP32],
+    norm_w:         pl.Tensor[[D],                           pl.FP32],
+    gate_w:         pl.Tensor[[N_EXPERTS, D],                pl.FP32],
+    gate_bias:      pl.Tensor[[N_EXPERTS],                   pl.FP32],
+    layer_id:       pl.Scalar[pl.INT32],
+    tid2eid:        pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
+    input_ids:      pl.Tensor[[B, S],                        pl.INT64],
+    expert_w1:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
+    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER],    pl.FP32],
+    expert_w3:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
+    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER],    pl.FP32],
+    expert_w2:      pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER],  pl.INT8],
+    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D],            pl.FP32],
+    shared_w1:      pl.Tensor[[MOE_INTER, D],                pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER],                  pl.FP32],
+    shared_w3:      pl.Tensor[[MOE_INTER, D],                pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER],                  pl.FP32],
+    shared_w2:      pl.Tensor[[D, MOE_INTER],                pl.INT8],
+    shared_w2_scale: pl.Tensor[[D],                          pl.FP32],
+    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1],  pl.INT32],
+    x_next:         pl.Out[pl.Tensor[[B, S, HC_MULT, D],     pl.BF16]],
+):
+    x_next = moe(
+        x_hc,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias,
+        tid2eid, input_ids,
+        expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
+        expert_w2, expert_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        recv_expert_count_full,
+        x_next,
+        layer_id,
+    )
+    return x_next
+
+
+# =============================================================================
+# Golden (torch reference): mirrors the DSL stages.
+# =============================================================================
+def golden_moe(tensors):
+    import torch
+
+    from hc_pre import golden_hc_pre
+    from hc_post import golden_hc_post
+    from moe_router import golden_moe_router_core
+    from moe_dispatch import golden_moe_dispatch
+    from moe_expert import golden_moe_expert
+    from moe_combine import golden_moe_combine
+
+    # Stage 1: hc_pre.
+    x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
+    post_t = torch.zeros(B, S, HC_MULT, dtype=torch.float32)
+    comb_t = torch.zeros(B, S, HC_MULT, HC_MULT, dtype=torch.float32)
+    golden_hc_pre({
+        "x":        tensors["x_hc"],
+        "hc_fn":    tensors["hc_ffn_fn"],
+        "hc_scale": tensors["hc_ffn_scale"],
+        "hc_base":  tensors["hc_ffn_base"],
+        "x_mixed":  x_mixed,
+        "post":     post_t,
+        "comb":     comb_t,
+    })
+
+    # Stage 2: router.
+    x_norm = torch.zeros(T, D, dtype=torch.bfloat16)
+    indices = torch.zeros(T, TOPK, dtype=torch.int32)
+    weights = torch.zeros(T, TOPK, dtype=torch.float32)
+    golden_moe_router_core({
+        "x_mixed":      x_mixed,
+        "norm_w":       tensors["norm_w"],
+        "gate_w":       tensors["gate_w"],
+        "gate_bias":    tensors["gate_bias"],
+        "layer_id":     tensors["layer_id"],
+        "tid2eid":      tensors["tid2eid"],
+        "input_ids":    tensors["input_ids"],
+        "x_norm":       x_norm,
+        "indices":      indices,
+        "weights":      weights,
+    })
+
+    # Stage 3: packed dispatch (recv_x is INT8, recv_scale_dq is per-token).
+    recv_x = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.int8)
+    recv_scale_dq = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
+    recv_weights = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
+    recv_token = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
+    recv_expert_count_actual = torch.zeros(N_LOCAL_EXPERTS, 1, dtype=torch.int32)
+    golden_moe_dispatch({
+        "x_norm":            x_norm,
+        "indices":           indices,
+        "weights":           weights,
+        "recv_x":            recv_x,
+        "recv_scale_dq":     recv_scale_dq,
+        "recv_weights":      recv_weights,
+        "recv_token":        recv_token,
+        "recv_expert_count": recv_expert_count_actual,
+    })
+
+    # Stage 4: experts.
+    recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16)
+    sh = torch.zeros(T, D, dtype=torch.bfloat16)
+    golden_moe_expert({
+        "recv_x":           recv_x,
+        "recv_scale_dq":    recv_scale_dq,
+        "recv_expert_count": tensors["recv_expert_count_full"],
+        "x_local":          x_norm,
+        "expert_w1":        tensors["expert_w1"],
+        "expert_w1_scale":  tensors["expert_w1_scale"],
+        "expert_w3":        tensors["expert_w3"],
+        "expert_w3_scale":  tensors["expert_w3_scale"],
+        "expert_w2":        tensors["expert_w2"],
+        "expert_w2_scale":  tensors["expert_w2_scale"],
+        "shared_w1":        tensors["shared_w1"],
+        "shared_w1_scale":  tensors["shared_w1_scale"],
+        "shared_w3":        tensors["shared_w3"],
+        "shared_w3_scale":  tensors["shared_w3_scale"],
+        "shared_w2":        tensors["shared_w2"],
+        "shared_w2_scale":  tensors["shared_w2_scale"],
+        "recv_y":           recv_y,
+        "sh":               sh,
+    })
+
+    # Stage 5: combine routed and shared expert outputs.
+    ffn_out = torch.zeros(B, S, D, dtype=torch.bfloat16)
+    golden_moe_combine({
+        "recv_y":            recv_y,
+        "recv_token":        recv_token,
+        "recv_weights":      recv_weights,
+        "recv_expert_count": recv_expert_count_actual,
+        "sh":                sh,
+        "ffn_out":           ffn_out,
+    })
+
+    # Stage 6: hc_post(ffn).
+    x_next = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
+    golden_hc_post({
+        "x":        ffn_out,
+        "residual": tensors["x_hc"],
+        "post":     post_t,
+        "comb":     comb_t,
+        "y":        x_next,
+    })
+
+    tensors["x_next"][:]  = x_next
+
+
+def build_tensor_specs(layer_id=0):
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    def round_haz(x):
+        return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
+
+    def quant_w_per_channel_last(w_bf16):
+        amax = w_bf16.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
+        scale_quant = INT8_SCALE_MAX / amax
+        scaled = w_bf16.float() * scale_quant.unsqueeze(-1)
+        w_i8 = round_haz(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+        return w_i8, (1.0 / scale_quant).float()
+
+    def init_x_hc():           return torch.randn(B, S, HC_MULT, D)
+    def init_hc_ffn_fn():      return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
+    def init_hc_ffn_scale():   return torch.ones(3) * 0.5
+    def init_hc_ffn_base():    return torch.zeros(MIX_HC)
+    def init_norm_w():         return torch.ones(D)
+    def init_gate_w():         return torch.randn(N_EXPERTS, D) / D ** 0.5
+    def init_gate_bias():      return torch.zeros(N_EXPERTS)
+    def init_tid2eid():
+        return torch.randint(0, N_EXPERTS, (VOCAB, TOPK), dtype=torch.int32)
+    def init_input_ids():
+        return torch.randint(0, VOCAB, (B, S), dtype=torch.int64)
+    def init_recv_expert_count_full():
+        return torch.full((N_LOCAL_EXPERTS, 1), RECV_MAX, dtype=torch.int32)
+
+    w1_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
+    w3_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
+    w2_bf16 = (torch.randn(N_LOCAL_EXPERTS, D, MOE_INTER) / MOE_INTER ** 0.5).to(torch.bfloat16)
+    sw1_bf16 = (torch.randn(MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
+    sw3_bf16 = (torch.randn(MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
+    sw2_bf16 = (torch.randn(D, MOE_INTER) / MOE_INTER ** 0.5).to(torch.bfloat16)
+    w1_i8, w1_s = quant_w_per_channel_last(w1_bf16)
+    w3_i8, w3_s = quant_w_per_channel_last(w3_bf16)
+    w2_i8, w2_s = quant_w_per_channel_last(w2_bf16)
+    sw1_i8, sw1_s = quant_w_per_channel_last(sw1_bf16)
+    sw3_i8, sw3_s = quant_w_per_channel_last(sw3_bf16)
+    sw2_i8, sw2_s = quant_w_per_channel_last(sw2_bf16)
+
+    return [
+        TensorSpec("x_hc",          [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("hc_ffn_fn",     [MIX_HC, HC_DIM],   torch.float32,  init_value=init_hc_ffn_fn),
+        TensorSpec("hc_ffn_scale",  [3],                torch.float32,  init_value=init_hc_ffn_scale),
+        TensorSpec("hc_ffn_base",   [MIX_HC],           torch.float32,  init_value=init_hc_ffn_base),
+        TensorSpec("norm_w",        [D],                torch.float32,  init_value=init_norm_w),
+        TensorSpec("gate_w",        [N_EXPERTS, D],     torch.float32,  init_value=init_gate_w),
+        TensorSpec("gate_bias",     [N_EXPERTS],        torch.float32,  init_value=init_gate_bias),
+        ScalarSpec("layer_id",      torch.int32,        layer_id),
+        TensorSpec("tid2eid",       [VOCAB, TOPK],      torch.int32,    init_value=init_tid2eid),
+        TensorSpec("input_ids",     [B, S],             torch.int64,    init_value=init_input_ids),
+        TensorSpec("expert_w1",        [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8,    init_value=lambda: w1_i8),
+        TensorSpec("expert_w1_scale",  [N_LOCAL_EXPERTS, MOE_INTER],    torch.float32, init_value=lambda: w1_s),
+        TensorSpec("expert_w3",        [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8,    init_value=lambda: w3_i8),
+        TensorSpec("expert_w3_scale",  [N_LOCAL_EXPERTS, MOE_INTER],    torch.float32, init_value=lambda: w3_s),
+        TensorSpec("expert_w2",        [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8,    init_value=lambda: w2_i8),
+        TensorSpec("expert_w2_scale",  [N_LOCAL_EXPERTS, D],            torch.float32, init_value=lambda: w2_s),
+        TensorSpec("shared_w1",        [MOE_INTER, D],                  torch.int8,    init_value=lambda: sw1_i8),
+        TensorSpec("shared_w1_scale",  [MOE_INTER],                     torch.float32, init_value=lambda: sw1_s),
+        TensorSpec("shared_w3",        [MOE_INTER, D],                  torch.int8,    init_value=lambda: sw3_i8),
+        TensorSpec("shared_w3_scale",  [MOE_INTER],                     torch.float32, init_value=lambda: sw3_s),
+        TensorSpec("shared_w2",        [D, MOE_INTER],                  torch.int8,    init_value=lambda: sw2_i8),
+        TensorSpec("shared_w2_scale",  [D],                             torch.float32, init_value=lambda: sw2_s),
+        TensorSpec("recv_expert_count_full", [N_LOCAL_EXPERTS, 1],       torch.int32,   init_value=init_recv_expert_count_full),
+        TensorSpec("x_next",        [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
+    ]
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    import torch
+    from golden import ratio_reldiff, run_jit
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a2a3sim",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument(
+        "--export-kernel-insight",
+        action="store_true",
+        default=False,
+        help=(
+            "After a successful run, export msprof op-simulator Insight traces "
+            "for all generated InCore kernels under the same build_output dir."
+        ),
+    )
+    parser.add_argument(
+        "--kernel-insight-func",
+        action="append",
+        default=[],
+        help="Only export this generated kernel function; can be repeated.",
+    )
+    args = parser.parse_args()
+    torch.manual_seed(args.seed)
+
+    result = run_jit(
+        fn=moe_test,
+        specs=build_tensor_specs(layer_id=args.layer_id),
+        golden_fn=golden_moe,
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_pmu=args.enable_pmu,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+        },
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
+
+    if args.export_kernel_insight:
+        if result.work_dir is None:
+            print("kernel insight export failed: run result has no build_output directory", file=sys.stderr)
+            raise SystemExit(1)
+        from tools.export_all_kernel_insight import StepError, main as export_kernel_insight
+
+        export_args = ["--build-dir", str(result.work_dir)]
+        for func in args.kernel_insight_func:
+            export_args.extend(["--func", func])
+        try:
+            export_rc = export_kernel_insight(export_args)
+        except StepError as exc:
+            print(f"kernel insight export failed: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        if export_rc != 0:
+            raise SystemExit(export_rc)

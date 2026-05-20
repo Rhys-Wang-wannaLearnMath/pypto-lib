@@ -51,7 +51,42 @@ jobs:
       - name: Run golden unit tests
         run: pytest tests/golden -v
 
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      files: ${{ steps.check.outputs.files }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "files=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only \
+            ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }} \
+            | grep -E '^(examples|models)/.*\.py$' | grep -v draft || true)
+          FILES=""
+          for f in $CHANGED; do
+            [ -f "$f" ] || continue
+            grep -q '__main__' "$f" && FILES="$FILES $f"
+          done
+          FILES=$(echo $FILES | xargs)
+          if [ -n "$FILES" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          echo "Selected files: $FILES"
+
   sim:
+    needs: detect-changes
+    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -60,10 +95,10 @@ jobs:
         platform: [a2a3sim, a5sim]
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.31
-      PTOAS_SHA256: cd9121b768f7383f5bda702c89507dd160f539c28bbdf57a0585be9473081d07
+      PTOAS_VERSION: v0.40
+      PTOAS_SHA256: 64c835839a9e1c3696617f82f3710705b3bd4b0bc0de3049d21b08885ac41c39
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: 5779238f
+      PTO_ISA_COMMIT: 2c607938
 
     steps:
       - name: Checkout pypto-lib
@@ -138,38 +173,78 @@ jobs:
 
       - name: Clone pto-isa repository (pinned)
         run: |
-          git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa \
+            || { rm -rf $GITHUB_WORKSPACE/pto-isa; git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa; }
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Run ${{ matrix.platform }} tests
+        shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          for f in $(find examples/beginner examples/intermediate -name '*.py' ! -name '*draft*' | sort); do
+          set +e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES="${{ needs.detect-changes.outputs.files }}"
+          else
+            FILES=$(find examples -name '*.py' ! -name '*draft*' | sort)
+          fi
+          if [ -z "$FILES" ]; then
+            echo "No runnable changed files; nothing to test."
+            exit 0
+          fi
+          failed=()
+          for f in $FILES; do
             echo "::group::$f"
-            python "$f" -p ${{ matrix.platform }}
+            if ! python "$f" -p ${{ matrix.platform }}; then
+              failed+=("$f")
+              echo "::error file=${f}::FAIL"
+            fi
             echo "::endgroup::"
           done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All selected files passed."
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf build_output
 
   a2a3:
+    needs: detect-changes
+    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
     timeout-minutes: 30
+    concurrency:
+      group: a2a3-serial
+      cancel-in-progress: false
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-8.5.0
+      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.31
-      PTOAS_SHA256: ca184d071cef3af989ff3f98e7ce4c7262ba1e07405738b65e9900c43065ada5
+      PTOAS_VERSION: v0.40
+      PTOAS_SHA256: 2fe83fe0c9087d40e2a4312e9816e8a1a16f63a48b0bcb21e27fb63736e0fab6
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: 5779238f
+      PTO_ISA_COMMIT: 2c607938
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: /root/.cache/ccache
+      CCACHE_MAXSIZE: 5G
+      PIP_CACHE_DIR: /root/.cache/pip
     container:
-      image: localhost:5000/ci-device-py310:latest
+      image: localhost:5001/ci-device-py310:latest
       options: >-
         --privileged
         -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
         -v /usr/local/Ascend:/usr/local/Ascend:ro
         -v /dev:/dev
-        -e ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.0
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip:/root/.cache/pip
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache:/root/.cache/ccache
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas:/opt/ptoas-cache
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src:/opt/pypto-src
+        -e ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.0.0
         -e DEVICE_ID
 
     steps:
@@ -188,58 +263,96 @@ jobs:
       - name: Add Ascend tools to PATH
         run: echo "$ASCEND_HOME_PATH/bin" >> $GITHUB_PATH
 
-      - name: Get pypto HEAD commit
-        id: pypto-hash
-        run: echo "hash=$(git ls-remote https://github.com/hw-native-sys/pypto.git HEAD | cut -f1)" >> $GITHUB_OUTPUT
-
-      - name: Cache pypto wheels
-        id: cache-pypto
-        uses: actions/cache@v4
-        with:
-          path: /tmp/pypto-wheels
-          key: pypto-${{ runner.os }}-${{ runner.arch }}-py3.10-${{ steps.pypto-hash.outputs.hash }}
-
-      - name: Build pypto wheels
-        if: steps.cache-pypto.outputs.cache-hit != 'true'
-        run: |
-          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
-          pip wheel /tmp/pypto -w /tmp/pypto-wheels --no-deps
-          pip wheel /tmp/pypto/runtime -w /tmp/pypto-wheels --no-deps
-
-      - name: Install pypto and simpler
-        run: pip install /tmp/pypto-wheels/*.whl
-
-      - name: Cache ptoas binary
-        id: cache-ptoas
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/ptoas-bin
-          key: ptoas-aarch64-${{ env.PTOAS_VERSION }}-${{ env.PTOAS_SHA256 }}
-
-      - name: Install ptoas
-        if: steps.cache-ptoas.outputs.cache-hit != 'true'
-        run: |
-          curl --fail --location --retry 3 --retry-all-errors \
-            https://github.com/hw-native-sys/PTOAS/releases/download/${{ env.PTOAS_VERSION }}/ptoas-bin-aarch64.tar.gz \
-            -o /tmp/ptoas-bin-aarch64.tar.gz
-          echo "${{ env.PTOAS_SHA256 }}  /tmp/ptoas-bin-aarch64.tar.gz" | sha256sum -c -
-          mkdir -p $GITHUB_WORKSPACE/ptoas-bin
-          tar -xzf /tmp/ptoas-bin-aarch64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
-          chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
-          chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
+      - name: Show ccache stats (before)
+        run: ccache -s || true
 
       - name: Clone pto-isa repository (pinned)
         run: |
-          git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa \
+            || { rm -rf $GITHUB_WORKSPACE/pto-isa; git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa; }
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
+      - name: Sync pypto source (local cache)
+        run: |
+          PYPTO_SRC="/opt/pypto-src"
+          if [ -d "$PYPTO_SRC/.git" ]; then
+            echo "Cache hit — updating pypto"
+            git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD
+            git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
+            git -C "$PYPTO_SRC" clean -ffdx
+            git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
+          else
+            echo "Cache miss — cloning pypto"
+            git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"
+          fi
+          git -C "$PYPTO_SRC" submodule update --init --recursive
+          rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild"
+          test ! -e "$PYPTO_SRC/build" && test ! -e "$PYPTO_SRC/_skbuild" \
+            && echo "OK: pypto build removed" \
+            || { echo "FAIL: pypto build dirs still exist"; exit 1; }
+          rm -rf "$PYPTO_SRC/runtime/build"
+          test ! -e "$PYPTO_SRC/runtime/build" \
+            && echo "OK: runtime build removed" \
+            || { echo "FAIL: runtime build dir still exists"; exit 1; }
+          pip install --no-build-isolation "$PYPTO_SRC"
+          pip install --no-build-isolation "$PYPTO_SRC/runtime"
+
+      - name: Show ccache stats (after)
+        run: ccache -s || true
+
+      - name: Install ptoas (local cache)
+        env:
+          PTOAS_CACHE_DIR: /opt/ptoas-cache
+        run: |
+          CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-aarch64-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
+          if [ ! -f "$CACHE_ARCHIVE" ]; then
+            echo "Cache miss — downloading ptoas ${PTOAS_VERSION}"
+            mkdir -p "$PTOAS_CACHE_DIR"
+            curl --fail --location --retry 3 --retry-all-errors \
+              https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
+              -o "$CACHE_ARCHIVE.tmp"
+            echo "${PTOAS_SHA256}  $CACHE_ARCHIVE.tmp" | sha256sum -c -
+            mv "$CACHE_ARCHIVE.tmp" "$CACHE_ARCHIVE"
+          else
+            echo "Cache hit — using $CACHE_ARCHIVE"
+            echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/ptoas-bin"
+          tar -xzf "$CACHE_ARCHIVE" -C "$GITHUB_WORKSPACE/ptoas-bin"
+          chmod +x "$GITHUB_WORKSPACE/ptoas-bin/ptoas"
+          chmod +x "$GITHUB_WORKSPACE/ptoas-bin/bin/ptoas"
+
       - name: Run a2a3 tests
+        shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          for f in $(find examples/beginner examples/intermediate -name '*.py' ! -name '*draft*' | sort); do
+          set +e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES="${{ needs.detect-changes.outputs.files }}"
+          else
+            FILES=$(find examples -name '*.py' ! -name '*draft*' | sort)
+          fi
+          if [ -z "$FILES" ]; then
+            echo "No runnable changed files; nothing to test."
+            exit 0
+          fi
+          failed=()
+          for f in $FILES; do
             echo "::group::$f"
-            python "$f" -p a2a3 -d $DEVICE_ID
+            if ! python "$f" -p a2a3 -d $DEVICE_ID; then
+              failed+=("$f")
+              echo "::error file=${f}::FAIL"
+            fi
             echo "::endgroup::"
           done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All selected files passed."
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf build_output
