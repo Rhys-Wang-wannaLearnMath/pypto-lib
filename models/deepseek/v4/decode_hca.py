@@ -10,8 +10,7 @@
 Composes ``attention_hca`` (hc_pre + qkv_proj + main compressor + sparse_attn + hc_post)
 with the MoE stack, matching ``Block.forward`` (model.py:688-700) for layers whose
 ``compress_ratio == 128`` (e.g. layers 3/5 in the demo). Inherits the HCA
-caller contract: runtime ``start_pos`` MUST equal compile-time ``START_POS``
-AND ``(START_POS + S) % COMPRESS_RATIO`` MUST be 0 — see attention_hca.py."""
+caller contract: ``start_pos`` is a per-row decode position tensor."""
 
 
 import pypto.language as pl
@@ -21,17 +20,16 @@ from config import (
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,
+    C128_COMPRESSOR_BLOCK_SIZE,
     EP_WORLD_SIZE,
-    RECV_MAX,
 )
-from attention_hca import attention_hca
+from decode_attention_hca import attention_hca
 from moe import moe
 
 
 # ---- shared model/decode constants (mirror attention_hca.py + moe.py) ----
 B = DECODE_BATCH
 S = DECODE_SEQ
-T = B * S
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
@@ -51,28 +49,21 @@ COMPRESS_RATIO = 128
 OVERLAP = COMPRESS_RATIO == 4           # always False for HCA
 COFF = 1 + int(OVERLAP)                 # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
-MAIN_STATE_LEN = COFF * COMPRESS_RATIO
 ORI_MAX_BLOCKS = 1
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+COMPRESS_STATE_MAX_BLOCKS = 64
+COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS
+COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
+COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO
-IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 SPARSE_IDX_TOPK = M.index_topk
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
-START_POS = COMPRESS_RATIO - S       # (START_POS + S) % COMPRESS_RATIO == 0 triggers compression
+START_POS = COMPRESS_RATIO - S       # default fixture exercises a compression step
 
-# Caller contract — same as attention_hca.py.
-SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + S) % COMPRESS_RATIO) == 0
-assert SHOULD_COMPRESS, (
-    f"Test fixture: START_POS={START_POS}, COMPRESS_RATIO={COMPRESS_RATIO}, S={S}; "
-    "need (START_POS+S) % COMPRESS_RATIO == 0."
-)
-
-Q_PROJ_OUT_CHUNK = 128
-Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
-SPARSE_ROPE_CHUNK = 16
-SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
+SPARSE_ROPE_TILE = 16
+SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 
 # ---- moe-local constants ----
 N_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE   # single-card simplification: router routes over local shard only
@@ -80,7 +71,6 @@ TOPK_E = M.num_experts_per_tok
 VOCAB = M.vocab_size
 MOE_INTER = M.moe_intermediate_size
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
-assert RECV_MAX >= T * TOPK_E, "packed layout needs RECV_MAX >= T * TOPK_E"
 
 
 @pl.jit.inline
@@ -95,25 +85,19 @@ def decode_hca(
     attn_norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    # ---- main compressor (ratio=128, rotate=False) ----
+    # ---- main compressor (ratio=128) ----
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    cmp_odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     # ---- attention KV cache (split into ori + cmp pools) ----
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
@@ -136,24 +120,22 @@ def decode_hca(
     tid2eid: pl.Tensor[[VOCAB, TOPK_E], pl.INT32],
     input_ids: pl.Tensor[[B, S], pl.INT64],
     # ---- moe expert weights ----
-    expert_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     # ---- output ----
     x_next: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    # ---- scalars ----
-    start_pos: pl.Scalar[pl.INT32],   # MUST equal compile-time START_POS — see header
-    cmp_rotate: pl.Scalar[pl.BOOL],   # always False on the ratio=128 path
+    # ---- decode metadata ----
+    start_pos: pl.Tensor[[B], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
 ):
     # Attention sub-block (HCA): hc_pre + attention(+compressor) + hc_post → x_attn.
@@ -163,16 +145,14 @@ def decode_hca(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, even_select_t, odd_select_t,
-        even_select_local, odd_select_local,
+        freqs_cos, freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_even_select, cmp_odd_select,
-        cmp_kv_state, cmp_score_state,
+        compress_state, compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         x_attn,
-        start_pos, cmp_rotate,
+        start_pos,
     )
 
     # MoE sub-block.
@@ -181,11 +161,10 @@ def decode_hca(
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias,
         tid2eid, input_ids,
-        expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
-        expert_w2, expert_w2_scale,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        recv_expert_count_full,
         x_next,
         layer_id,
     )
@@ -201,24 +180,18 @@ def decode_hca_test(
     attn_norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    cmp_odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -236,22 +209,20 @@ def decode_hca_test(
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK_E], pl.INT32],
     input_ids: pl.Tensor[[B, S], pl.INT64],
-    expert_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     x_next: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
-    start_pos: pl.Scalar[pl.INT32],
-    cmp_rotate: pl.Scalar[pl.BOOL],
+    start_pos: pl.Tensor[[B], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
 ):
     x_next = decode_hca(
@@ -259,24 +230,21 @@ def decode_hca_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, even_select_t, odd_select_t,
-        even_select_local, odd_select_local,
+        freqs_cos, freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_even_select, cmp_odd_select,
-        cmp_kv_state, cmp_score_state,
+        compress_state, compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias,
         tid2eid, input_ids,
-        expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
-        expert_w2, expert_w2_scale,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        recv_expert_count_full,
         x_next,
-        start_pos, cmp_rotate, layer_id,
+        start_pos, layer_id,
     )
     return x_next
 
@@ -285,7 +253,7 @@ def golden_decode_hca(tensors):
     """Chains golden_attention_hca and golden_moe (decode branch)."""
     import torch
 
-    from attention_hca import golden_attention_hca
+    from decode_attention_hca import golden_attention_hca
     from moe import golden_moe
 
     x_attn = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
@@ -298,7 +266,7 @@ def golden_decode_hca(tensors):
     golden_moe(moe_tensors)
 
 
-def build_tensor_specs(layer_id: int = 0):
+def build_tensor_specs(layer_id: int = 0, start_pos: int = START_POS, hetero_start_pos: bool = False):
     """Merges attention_hca and moe specs and reorders them to match the
     positional parameter order of ``decode_hca_test``. The harness binds
     dummy_args positionally, so spec order is load-bearing.
@@ -307,11 +275,11 @@ def build_tensor_specs(layer_id: int = 0):
       - attn ``x_out``  (intermediate, not exposed)
       - moe ``x_hc``    (provided by attn output)
     """
-    from attention_hca import build_tensor_specs as build_attn_specs
+    from decode_attention_hca import build_tensor_specs as build_attn_specs
     from moe import build_tensor_specs as build_moe_specs
 
     by_name = {}
-    for s in build_attn_specs():
+    for s in build_attn_specs(start_pos=start_pos, hetero_start_pos=hetero_start_pos):
         by_name[s.name] = s
     for s in build_moe_specs(layer_id=layer_id):
         by_name.setdefault(s.name, s)
@@ -322,11 +290,9 @@ def build_tensor_specs(layer_id: int = 0):
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
         "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv",
         "gamma_cq", "gamma_ckv",
-        "freqs_cos", "freqs_sin", "even_select_t", "odd_select_t",
-        "even_select_local", "odd_select_local",
+        "freqs_cos", "freqs_sin",
         "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
-        "cmp_even_select", "cmp_odd_select",
-        "cmp_kv_state", "cmp_score_state",
+        "compress_state", "compress_state_block_table",
         "kv_cache", "ori_block_table", "cmp_kv", "cmp_block_table",
         "attn_sink", "seqused_kv",
         "wo_a", "wo_b", "wo_b_scale",
@@ -334,17 +300,16 @@ def build_tensor_specs(layer_id: int = 0):
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
         "norm_w", "gate_w", "gate_bias",
         "tid2eid", "input_ids",
-        "expert_w1", "expert_w1_scale",
-        "expert_w3", "expert_w3_scale",
-        "expert_w2", "expert_w2_scale",
+        "routed_w1", "routed_w1_scale",
+        "routed_w3", "routed_w3_scale",
+        "routed_w2", "routed_w2_scale",
         "shared_w1", "shared_w1_scale",
         "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
-        "recv_expert_count_full",
         # ---- output ----
         "x_next",
-        # ---- scalars ----
-        "start_pos", "cmp_rotate", "layer_id",
+        # ---- metadata/scalars ----
+        "start_pos", "layer_id",
     ]
 
     missing = [n for n in order if n not in by_name]
@@ -360,9 +325,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+                        choices=["a2a3", "a5"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS)
+    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
@@ -370,7 +337,11 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=decode_hca_test,
-        specs=build_tensor_specs(layer_id=args.layer_id),
+        specs=build_tensor_specs(
+            layer_id=args.layer_id,
+            start_pos=args.start_pos,
+            hetero_start_pos=args.hetero_start_pos,
+        ),
         golden_fn=golden_decode_hca,
         runtime_cfg=dict(
             platform=args.platform,

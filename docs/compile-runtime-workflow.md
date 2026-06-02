@@ -2,7 +2,8 @@
 
 What happens when you run `python <kernel>.py -p <platform>`. All
 pypto-lib examples and model kernels follow the same flow, driven by
-`golden.run`.
+`golden.run` — or `golden.run_jit` for kernels written as a module-level
+`@pl.jit` function instead of a `@pl.program` class.
 
 ## CLI shape
 
@@ -19,14 +20,17 @@ result = run(
     program=build_qwen3_decode_program(...),  # @pl.program class
     specs=build_tensor_specs(...),            # ordered TensorSpec / ScalarSpec list
     golden_fn=golden_qwen3_decode,            # PyTorch reference
-    config=RunConfig(
-        rtol=3e-3, atol=3e-3,
-        compile=dict(dump_passes=True),
-        runtime=dict(platform=args.platform, device_id=args.device,
+    compile_cfg=dict(dump_passes=True),
+    runtime_cfg=dict(platform=args.platform, device_id=args.device,
                      enable_l2_swimlane=args.enable_l2_swimlane),
-    ),
+    rtol=3e-3, atol=3e-3,
 )
 ```
+
+A kernel written as a module-level `@pl.jit` function calls **`run_jit`**
+instead, passing `fn=<jit_function>` in place of `program=`. Everything
+else — `specs`, `golden_fn`, the tolerances, and the phases below — is
+identical.
 
 | Flag | Purpose |
 |------|---------|
@@ -38,6 +42,31 @@ result = run(
 `a2a3*` maps to `BackendType.Ascend910B`; `a5*` maps to
 `BackendType.Ascend950`.
 
+### Multi-card kernels in CI
+
+Most kernels take a single `-d <id>`. A kernel that needs several NPUs
+(e.g. a 2-rank EP program parsing `-d` as a comma-separated list) must
+declare its card count with a marker comment near the top of the file:
+
+```python
+# ci: devices=2
+```
+
+The real-NPU CI job greps for `# ci: devices=N`; when `N > 1` it runs the
+file with `$DEVICE_RANGE` (a comma-separated id list such as `0,1`)
+instead of the single `$DEVICE_ID`. Files without the marker default to
+one device. See the `a2a3` job in
+[.github/workflows/ci.yml](../.github/workflows/ci.yml).
+
+Multi-card kernels use HCCL, which silent-crashes inside docker and breaks
+when `PTO2_RING_*` are set. For this reason the real-NPU job runs **on the
+host (no container)** — set up via conda + `set_env.sh`, mirroring pypto's
+`dist-system-tests` — and unsets `PTO2_RING_*` for multi-card files while
+keeping the large ring sizes for single-card ones. Running a multi-card
+kernel locally needs the same: a real `set_env.sh`-sourced shell with
+`PTO2_RING_*` unset, e.g.
+`python models/deepseek/v4/moe_ep.py -p a2a3 -d 0,1`.
+
 ## Phases inside `golden.run`
 
 The harness prints `[RUN] <stage> ...` / `[RUN] <stage> done (Xs)` around
@@ -45,7 +74,7 @@ each phase, so the console log is the authoritative trace of what ran:
 
 ### 1. Compile (pypto)
 
-Driven by the **pypto** repo. `pypto.ir.compile(program, backend_type=..., **config.compile)`
+Driven by the **pypto** repo. `pypto.ir.compile(program, backend_type=..., **compile_cfg)`
 runs in two sub-stages: a **pass pipeline** that transforms the IR, then a
 **codegen pipeline** that emits files. Output goes under
 `build_output/<ProgramName>_<timestamp>/`.
@@ -110,7 +139,7 @@ build_output/<ProgramName>_<ts>/
 
 #### Compile knobs
 
-Forwarded from `config.compile` to `ir.compile`:
+Forwarded from `compile_cfg` to `ir.compile`:
 
 | Kwarg | Purpose |
 |-------|---------|
@@ -142,15 +171,31 @@ be replayed later. If `golden_data=<dir>` is passed instead, the harness
 loads `<dir>/in/*.pt` rather than generating fresh data — useful for
 deterministic regression checks.
 
-### 3. Runtime (simpler)
+### 3. Compute golden
+
+The golden runs **before** device execution: it depends only on the input
+snapshot, not on the runtime, so the reference is ready for validation and
+a later runtime crash still leaves a usable `data/out/`.
+
+If `golden_fn` is provided, `run` builds a `scratch` dict with cloned
+inputs and zero-init outputs, calls `golden_fn(scratch)` (which fills the
+output entries in place), and writes the result to `data/out/<name>.pt`.
+
+If `golden_data=<dir>` is set, the harness loads `<dir>/out/*.pt` instead
+of recomputing — `golden_data` always wins over `golden_fn`.
+
+If neither is provided, validation is skipped and the run reports
+`PASS (validation skipped)`.
+
+### 4. Runtime (simpler)
 
 Driven by the **simpler** repo (PTO2 runtime).
-`pypto.runtime.execute_compiled(work_dir, ordered_args, **config.runtime)`
+`pypto.runtime.execute_compiled(work_dir, ordered_args, **runtime_cfg)`
 loads the compiled artifacts onto the target platform and runs them.
 Tensors passed by reference are mutated in place: outputs land back into
 the same Python tensors after the call returns.
 
-`config.runtime` is forwarded verbatim — `platform`, `device_id`, the
+`runtime_cfg` is forwarded verbatim — `platform`, `device_id`, the
 runtime DFX flags below, and any other runtime knobs. Refer to the
 simpler repo for the full set of runtime options and platform-specific
 behavior.
@@ -158,7 +203,7 @@ behavior.
 #### Runtime DFX flags
 
 PyPTO surfaces simpler's four runtime DFX (Design For X) sub-features as
-independent toggles on `RunConfig.runtime`. They share the same output
+independent toggles on `runtime_cfg`. They share the same output
 directory but can be enabled in any combination:
 
 | Kwarg | CLI flag | Artefact under `dfx_outputs/` |
@@ -197,23 +242,11 @@ full per-flag details.
 > a deprecated alias for `enable_l2_swimlane` / `--enable-l2-swimlane`.
 > It still works but emits a `DeprecationWarning` and will be removed.
 
-### 4. Compute golden
-
-If `golden_fn` is provided, `run` builds a `scratch` dict with cloned
-inputs and zero-init outputs, calls `golden_fn(scratch)` (which fills the
-output entries in place), and writes the result to `data/out/<name>.pt`.
-
-If `golden_data=<dir>` is set, the harness loads `<dir>/out/*.pt` instead
-of recomputing — `golden_data` always wins over `golden_fn`.
-
-If neither is provided, validation is skipped and the run reports
-`PASS (validation skipped)`.
-
 ### 5. Validate
 
 `golden.validation.validate_golden` compares each device output against
 the golden using `torch.allclose(rtol, atol)` by default. Override
-per-output with `RunConfig.compare_fn={"out_name": custom_callable}`.
+per-output with the `compare_fn={"out_name": custom_callable}` argument.
 `golden.validation` ships three ready-made comparators:
 
 | Comparator | Use case |
@@ -229,7 +262,7 @@ failure (compile error, runtime crash, validation mismatch) it returns
 
 ## Skipping phases
 
-`RunConfig` and `run` knobs that short-circuit the pipeline:
+`run` / `run_jit` knobs that short-circuit the pipeline:
 
 | Knob | Effect |
 |------|--------|
@@ -237,13 +270,5 @@ failure (compile error, runtime crash, validation mismatch) it returns
 | `runtime_dir="<path>"` (kwarg to `run`) | Skips compile and reuses an existing `build_output/<...>` directory. Useful when iterating on `golden_fn` or validation logic without recompiling. |
 | `golden_data="<path>"` (kwarg to `run`) | Loads inputs from `<path>/in/` and goldens from `<path>/out/` instead of generating them. `golden_data` overrides `golden_fn`. Useful for deterministic regressions: a previous run leaves these files in its `data/` dir, so passing that dir reproduces the exact failing inputs. |
 
-## Debugging
-
-- **Compile failure** — passes dump under `build_output/<...>/passes_dump/`
-  shows the IR at each pass; `report/` has scheduling diagnostics.
-- **Runtime crash** — the simulator (`*sim`) gives more diagnostic output
-  than the device backend; rerun with `-p a2a3sim` (or `a5sim`) for
-  reproductions.
-- **Validation mismatch** — the run leaves `data/in/` and `data/out/`
-  populated, so `golden_data="<work_dir>"` reproduces the exact failing
-  inputs without re-rolling random data.
+For diagnosing compile errors, runtime hangs, and precision mismatches, see
+[debugging.md](debugging.md).

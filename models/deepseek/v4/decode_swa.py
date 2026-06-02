@@ -10,7 +10,8 @@
 Composes ``attention_swa`` (hc_pre + qkv_proj + sparse_attn + hc_post) with
 the MoE stack (hc_pre + router + dispatch + expert + combine + hc_post),
 matching ``Block.forward`` (model.py:688-700) for layers whose
-``compress_ratio == 0`` (layers 0/1/7 in the demo)."""
+``compress_ratio == 0`` (layers 0/1/7 in the demo). ``start_pos`` follows
+the decode metadata contract and is passed as a per-row tensor."""
 
 
 import pypto.language as pl
@@ -21,16 +22,14 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     EP_WORLD_SIZE,
-    RECV_MAX,
 )
-from attention_swa import attention_swa
+from decode_attention_swa import attention_swa
 from moe import moe
 
 
 # ---- shared model/decode constants (mirror attention_swa.py + moe.py) ----
 B = DECODE_BATCH
 S = DECODE_SEQ
-T = B * S
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
@@ -62,7 +61,6 @@ TOPK_E = M.num_experts_per_tok          # router topk (experts/token)
 VOCAB = M.vocab_size
 MOE_INTER = M.moe_intermediate_size
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
-assert RECV_MAX >= T * TOPK_E, "packed layout needs RECV_MAX >= T * TOPK_E"
 
 
 @pl.jit.inline
@@ -77,16 +75,12 @@ def decode_swa(
     attn_norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     # ---- attention KV cache (sliding-window only) ----
     kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
@@ -107,23 +101,22 @@ def decode_swa(
     tid2eid: pl.Tensor[[VOCAB, TOPK_E], pl.INT32],
     input_ids: pl.Tensor[[B, S], pl.INT64],
     # ---- moe expert weights ----
-    expert_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     # ---- output ----
     x_next: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    # ---- scalars ----
-    start_pos: pl.Scalar[pl.INT32],
+    # ---- decode metadata ----
+    start_pos: pl.Tensor[[B], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
 ):
     # Attention sub-block: hc_pre + attention + hc_post → x_attn (HC stack).
@@ -133,8 +126,7 @@ def decode_swa(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, even_select_t, odd_select_t,
-        even_select_local, odd_select_local,
+        freqs_cos, freqs_sin,
         kv_cache, block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
@@ -148,11 +140,10 @@ def decode_swa(
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias,
         tid2eid, input_ids,
-        expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
-        expert_w2, expert_w2_scale,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        recv_expert_count_full,
         x_next,
         layer_id,
     )
@@ -168,16 +159,12 @@ def decode_swa_test(
     attn_norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -193,21 +180,20 @@ def decode_swa_test(
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK_E], pl.INT32],
     input_ids: pl.Tensor[[B, S], pl.INT64],
-    expert_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     x_next: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
-    start_pos: pl.Scalar[pl.INT32],
+    start_pos: pl.Tensor[[B], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
 ):
     x_next = decode_swa(
@@ -215,19 +201,17 @@ def decode_swa_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, even_select_t, odd_select_t,
-        even_select_local, odd_select_local,
+        freqs_cos, freqs_sin,
         kv_cache, block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias,
         tid2eid, input_ids,
-        expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
-        expert_w2, expert_w2_scale,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        recv_expert_count_full,
         x_next,
         start_pos, layer_id,
     )
@@ -238,7 +222,7 @@ def golden_decode_swa(tensors):
     """Chains golden_attention_swa and golden_moe (decode branch)."""
     import torch
 
-    from attention_swa import golden_attention_swa
+    from decode_attention_swa import golden_attention_swa
     from moe import golden_moe
 
     # Stage A: attention_swa writes its HC output to a local intermediate.
@@ -253,7 +237,7 @@ def golden_decode_swa(tensors):
     golden_moe(moe_tensors)
 
 
-def build_tensor_specs(layer_id: int = 0):
+def build_tensor_specs(layer_id: int = 0, start_pos: int = START_POS, hetero_start_pos: bool = False):
     """Merges attention_swa and moe specs and reorders them to match the
     positional parameter order of ``decode_swa_test``. The harness binds
     dummy_args positionally, so spec order is load-bearing.
@@ -262,11 +246,11 @@ def build_tensor_specs(layer_id: int = 0):
       - attn ``x_out``  (intermediate, not exposed)
       - moe ``x_hc``    (provided by attn output)
     """
-    from attention_swa import build_tensor_specs as build_attn_specs
+    from decode_attention_swa import build_tensor_specs as build_attn_specs
     from moe import build_tensor_specs as build_moe_specs
 
     by_name = {}
-    for s in build_attn_specs():
+    for s in build_attn_specs(start_pos=start_pos, hetero_start_pos=hetero_start_pos):
         by_name[s.name] = s
     for s in build_moe_specs(layer_id=layer_id):
         by_name.setdefault(s.name, s)
@@ -277,8 +261,7 @@ def build_tensor_specs(layer_id: int = 0):
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
         "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv",
         "gamma_cq", "gamma_ckv",
-        "freqs_cos", "freqs_sin", "even_select_t", "odd_select_t",
-        "even_select_local", "odd_select_local",
+        "freqs_cos", "freqs_sin",
         "kv_cache", "block_table",
         "attn_sink", "seqused_kv",
         "wo_a", "wo_b", "wo_b_scale",
@@ -286,16 +269,15 @@ def build_tensor_specs(layer_id: int = 0):
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
         "norm_w", "gate_w", "gate_bias",
         "tid2eid", "input_ids",
-        "expert_w1", "expert_w1_scale",
-        "expert_w3", "expert_w3_scale",
-        "expert_w2", "expert_w2_scale",
+        "routed_w1", "routed_w1_scale",
+        "routed_w3", "routed_w3_scale",
+        "routed_w2", "routed_w2_scale",
         "shared_w1", "shared_w1_scale",
         "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
-        "recv_expert_count_full",
         # ---- output ----
         "x_next",
-        # ---- scalars ----
+        # ---- metadata/scalars ----
         "start_pos", "layer_id",
     ]
 
@@ -312,9 +294,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+                        choices=["a2a3", "a5"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS)
+    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
@@ -322,7 +306,11 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=decode_swa_test,
-        specs=build_tensor_specs(layer_id=args.layer_id),
+        specs=build_tensor_specs(
+            layer_id=args.layer_id,
+            start_pos=args.start_pos,
+            hetero_start_pos=args.hetero_start_pos,
+        ),
         golden_fn=golden_decode_swa,
         runtime_cfg=dict(
             platform=args.platform,

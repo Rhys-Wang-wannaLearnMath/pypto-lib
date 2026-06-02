@@ -112,7 +112,7 @@ DEMO = DeepSeekV4Config(
     rms_norm_eps=1e-6,
     vocab_size=129280,
     moe_intermediate_size=4096,
-    n_routed_experts=8,
+    n_routed_experts=16,
     n_shared_experts=1,
     num_experts_per_tok=2,
     scoring_func="sqrtsoftplus",
@@ -174,7 +174,7 @@ FLASH = DeepSeekV4Config(
     hc_mult=4,
     hc_sinkhorn_iters=20,
     hc_eps=1e-6,
-    max_position_embeddings=8192,
+    max_position_embeddings=8192,  # official 1M;
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
     rope_factor=16.0,
@@ -239,11 +239,17 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 
 # Deployment constants
-DECODE_BATCH = 64          # B: tokens per decode step
-DECODE_SEQ = 2             # S: 2 tokens per step (MTP)
+DECODE_BATCH = 64                 # B: tokens per decode step
+DECODE_SEQ = 2                    # S: 2 tokens per step (MTP)
+DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
+PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
+PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
+C4A_COMPRESSOR_BLOCK_SIZE = 4             # ratio-4 compressor state page size
+C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
+LM_HEAD_TP_SIZE = 16
 
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127
@@ -256,3 +262,9 @@ EP_RANK = 0
 RECV_SAFETY = 4
 RECV_MAX = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
             // (FLASH.n_routed_experts // EP_WORLD_SIZE)) * RECV_SAFETY
+
+# When True, gate.py's N_EXPERTS uses the full global expert space
+# (M.n_routed_experts) so indices cover [0, N_EXPERTS_GLOBAL). Default False
+# keeps the legacy single-card behavior where each rank only routes over its
+# own shard. moe_ep.py flips this before importing gate.
+EP_ROUTING_GLOBAL = False
